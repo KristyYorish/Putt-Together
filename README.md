@@ -7,6 +7,7 @@ Find people to golf with across BC.
 | File | What it does |
 | --- | --- |
 | `src/putt-together.jsx` | The app |
+| `src/courses.js` | Every BC golf course and pitch & putt, tagged by area. Edit this file to add or remove a course |
 | `src/storage.js` | Saves your profile in your browser and posted games on Netlify, so everyone sees the same games |
 | `src/main.jsx`, `index.html` | Starts the app |
 | `netlify/functions/storage.mjs` | Shared storage for posted games (uses Netlify Blobs, no setup needed) |
