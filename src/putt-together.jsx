@@ -1,4 +1,5 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from "react";
+import { COURSES } from "./courses.js";
 
 /*
   PUTT TOGETHER — find people to golf with across BC
@@ -37,19 +38,13 @@ const VIBES = {
   keen: { label: "Keen", hint: "playing to our handicaps" },
 };
 
-// Suggestions only. People can type any course name.
-const COURSES = [
-  "Stanley Park Pitch & Putt",
-  "Queen Elizabeth Pitch & Putt",
-  "Rupert Park Pitch & Putt",
-  "Central Park Pitch & Putt",
-  "Langara Golf Course",
-  "Fraserview Golf Course",
-  "McCleery Golf Course",
-  "Burnaby Mountain Golf Course",
-  "Riverway Golf Course",
-  "Cedar Hill Golf Course",
-];
+// Course list lives in src/courses.js. People can still type any course name.
+const courseKey = (name) => name.trim().toLowerCase();
+const COURSE_BY_NAME = new Map(COURSES.map((c) => [courseKey(c.name), c]));
+const findCourse = (name) => COURSE_BY_NAME.get(courseKey(name || ""));
+// The longest round a course offers, used to pre-fill "Type of golf"
+const bestType = (c) => (c.types.includes("18") ? "18" : c.types.includes("9") ? "9" : "pnp");
+const byName = (a, b) => a.name.replace(/^The /, "").localeCompare(b.name.replace(/^The /, ""));
 
 const GAMES_KEY = "putt-games-v1"; // shared: everyone sees posted games
 const PROFILE_KEY = "putt-profile-v1"; // personal: only this person
@@ -190,7 +185,7 @@ const css = `
 .textsize[aria-pressed="true"] { background: var(--flag); color: var(--ink); border-color: var(--flag); }
 
 .tabs { position: sticky; top: 0; z-index: 20; background: #fff; border-bottom: 2px solid var(--line); }
-.tabs-inner { max-width: 38em; margin: 0 auto; display: grid; grid-template-columns: repeat(3, 1fr); gap: .4em; padding: .5em 1em; }
+.tabs-inner { max-width: 38em; margin: 0 auto; display: grid; grid-template-columns: repeat(4, 1fr); gap: .4em; padding: .5em 1em; }
 .tab { font: inherit; font-weight: 700; font-size: .95em; min-height: 3em; border-radius: 10px; border: 2px solid transparent; background: transparent; color: var(--fairway); cursor: pointer; padding: .3em .4em; }
 .tab[aria-current="page"] { background: var(--fairway); color: #fff; }
 .tab:not([aria-current="page"]):hover { border-color: var(--line); }
@@ -292,6 +287,15 @@ const css = `
   @keyframes pop { from { transform: translateY(8px); opacity: 0; } to { transform: none; opacity: 1; } }
 }
 
+.search { display: grid; gap: 1em; }
+.courselist { list-style: none; margin: 0; padding: 0; display: grid; gap: .8em; }
+.course { background: #fff; border: 2px solid var(--line); border-radius: 14px; padding: 1em 1.1em; display: grid; gap: .6em; }
+.course h3 { font-size: 1.15em; }
+.course-city { color: var(--muted); margin-top: .15em; }
+.course-games { font-weight: 700; color: var(--fairway-dark); }
+.course .btn { width: auto; justify-self: start; }
+.course-actions { display: flex; flex-wrap: wrap; gap: .5em; }
+
 .foot { font-size: .9em; color: var(--muted); display: grid; gap: .5em; border-top: 2px solid var(--line); padding-top: 1.2em; }
 .preview { background: #fff; border: 2px dashed var(--muted); border-radius: 10px; padding: .6em .8em; }
 
@@ -300,6 +304,9 @@ const css = `
   .card { grid-template-columns: 3.8em 1fr; }
   .card-body { padding: .9em .85em 1.1em; }
   .tagline { display: none; }
+  .tabs-inner { grid-template-columns: repeat(2, 1fr); gap: .3em; padding: .4em 1em; }
+  .tab { min-height: 2.6em; }
+  .course .btn { width: 100%; }
 }
 `;
 
@@ -459,9 +466,8 @@ function GameCard({ game, me, onJoin, onLeave, onCancel, onPostMessage }) {
       <div className="card-body">
         <div className="tags">
           <span className="tag">{TYPES[game.type]}</span>
-          {game.sample && <span className="tag">Sample</span>}
           {game.cancelled && <span className="tag stop">Cancelled by the host</span>}
-          {!game.cancelled && !game.sample && open > 0 && (
+          {!game.cancelled && open > 0 && (
             <span className="tag flag">
               {open} open {open === 1 ? "spot" : "spots"}
             </span>
@@ -519,7 +525,7 @@ function GameCard({ game, me, onJoin, onLeave, onCancel, onPostMessage }) {
           </div>
         </div>
 
-        {!game.sample && !game.cancelled && (
+        {!game.cancelled && (
           <div className="actions">
             {isHost ? (
               <>
@@ -546,8 +552,6 @@ function GameCard({ game, me, onJoin, onLeave, onCancel, onPostMessage }) {
             )}
           </div>
         )}
-
-        {game.sample && <p className="muted">This is a sample. Real games posted by golfers will show up here.</p>}
 
         {(isHost || inGame) && !game.cancelled && <GroupMessages game={game} onPost={onPostMessage} />}
       </div>
@@ -617,12 +621,17 @@ function Onboarding({ onDone }) {
   );
 }
 
-function FindGames({ games, samples, me, filters, setFilters, onRefresh, refreshing, goHost, cardProps }) {
+function FindGames({ games, me, filters, setFilters, onRefresh, refreshing, goHost, cardProps }) {
   const live = games.filter((g) => !g.cancelled);
   const list = live
-    .filter((g) => (filters.area === "all" || g.area === filters.area) && (filters.type === "any" || g.type === filters.type))
+    .filter(
+      (g) =>
+        (filters.area === "all" || g.area === filters.area) &&
+        (filters.type === "any" || g.type === filters.type) &&
+        (!filters.course || courseKey(g.course) === courseKey(filters.course))
+    )
     .sort((a, b) => gameStart(a) - gameStart(b));
-  const showSamples = live.length === 0;
+  const noGames = live.length === 0;
 
   return (
     <main className="wrap">
@@ -654,19 +663,25 @@ function FindGames({ games, samples, me, filters, setFilters, onRefresh, refresh
         </div>
       </section>
 
-      {showSamples ? (
-        <>
-          <section className="panel empty">
-            <h2>No games posted yet</h2>
-            <p>Be the first. Post a tee time and other golfers can join you. Below are a few samples of what a posted game looks like.</p>
-            <button className="btn" onClick={goHost}>
-              Host a game
-            </button>
-          </section>
-          {samples.map((g) => (
-            <GameCard key={g.id} game={g} me={me} {...cardProps} />
-          ))}
-        </>
+      {filters.course && !noGames && (
+        <section className="panel">
+          <p>
+            Showing games at <strong>{filters.course}</strong> only.
+          </p>
+          <button className="linkbtn" onClick={() => setFilters({ ...filters, course: "" })}>
+            Show games at all courses
+          </button>
+        </section>
+      )}
+
+      {noGames ? (
+        <section className="panel empty">
+          <h2>No games posted yet</h2>
+          <p>Be the first. Post a tee time and other golfers can join you.</p>
+          <button className="btn" onClick={goHost}>
+            Host a game
+          </button>
+        </section>
       ) : (
         <>
           <div className="listhead">
@@ -695,7 +710,7 @@ function FindGames({ games, samples, me, filters, setFilters, onRefresh, refresh
   );
 }
 
-function HostGame({ me, onPost }) {
+function HostGame({ me, onPost, prefill }) {
   const tomorrow = useMemo(() => {
     const d = new Date();
     d.setDate(d.getDate() + 1);
@@ -713,10 +728,22 @@ function HostGame({ me, onPost }) {
     meetAt: "At the pro shop, 15 minutes before tee time",
     note: "",
   };
-  const [f, setF] = useState(blank);
+  const [f, setF] = useState(() => {
+    const c = prefill && findCourse(prefill);
+    return c ? { ...blank, course: c.name, area: c.area, type: bestType(c) } : blank;
+  });
   const [errors, setErrors] = useState({});
   const [saving, setSaving] = useState(false);
   const up = (k, val) => setF((p) => ({ ...p, [k]: val }));
+  const areaCourses = useMemo(() => COURSES.filter((c) => c.area === f.area).sort(byName), [f.area]);
+
+  // Picking a course from the list fills in its area and type of golf
+  const chooseCourse = (value) =>
+    setF((p) => {
+      const c = findCourse(value);
+      if (!c) return { ...p, course: value };
+      return { ...p, course: c.name, area: c.area, type: c.types.includes(p.type) ? p.type : bestType(c) };
+    });
 
   const submit = async () => {
     const e = {};
@@ -744,11 +771,34 @@ function HostGame({ me, onPost }) {
       </section>
 
       <section className="panel" aria-label="Game details">
-        <Field id="course" label="Course name" hint="Start typing, or enter any course." error={errors.course}>
-          <input id="course" type="text" list="course-list" value={f.course} onChange={(e) => up("course", e.target.value)} aria-invalid={!!errors.course} />
+        <Field id="h-area" label="Area">
+          <select id="h-area" value={f.area} onChange={(e) => up("area", e.target.value)}>
+            {AREAS.map((a) => (
+              <option key={a}>{a}</option>
+            ))}
+          </select>
+        </Field>
+
+        <Field
+          id="course"
+          label="Course name"
+          hint={`Start typing to see courses in ${f.area}. If yours isn't listed, just type its name.`}
+          error={errors.course}
+        >
+          <input
+            id="course"
+            type="text"
+            list="course-list"
+            autoComplete="off"
+            value={f.course}
+            onChange={(e) => chooseCourse(e.target.value)}
+            aria-invalid={!!errors.course}
+          />
           <datalist id="course-list">
-            {COURSES.map((c) => (
-              <option key={c} value={c} />
+            {areaCourses.map((c) => (
+              <option key={c.name} value={c.name}>
+                {c.city}
+              </option>
             ))}
           </datalist>
         </Field>
@@ -761,14 +811,6 @@ function HostGame({ me, onPost }) {
           onChange={(v) => up("type", v)}
           options={Object.entries(TYPES).map(([value, label]) => ({ value, label }))}
         />
-
-        <Field id="h-area" label="Area">
-          <select id="h-area" value={f.area} onChange={(e) => up("area", e.target.value)}>
-            {AREAS.map((a) => (
-              <option key={a}>{a}</option>
-            ))}
-          </select>
-        </Field>
 
         <Field id="date" label="Date" error={errors.date}>
           <input id="date" type="date" min={toISODate(new Date())} value={f.date} onChange={(e) => up("date", e.target.value)} aria-invalid={!!errors.date} />
@@ -822,6 +864,119 @@ function HostGame({ me, onPost }) {
           {saving ? "Posting…" : "Post this game"}
         </button>
       </section>
+    </main>
+  );
+}
+
+function CourseList({ me, games, onHostHere, onSeeGames }) {
+  const [area, setArea] = useState(me.area);
+  const [type, setType] = useState("any");
+  const [query, setQuery] = useState("");
+
+  const gameCounts = useMemo(() => {
+    const counts = {};
+    games.filter((g) => !g.cancelled).forEach((g) => {
+      const k = courseKey(g.course);
+      counts[k] = (counts[k] || 0) + 1;
+    });
+    return counts;
+  }, [games]);
+
+  const q = query.trim().toLowerCase();
+  const list = COURSES.filter(
+    (c) =>
+      (area === "all" || c.area === area) &&
+      (type === "any" || c.types.includes(type)) &&
+      (!q || c.name.toLowerCase().includes(q) || c.city.toLowerCase().includes(q))
+  ).sort((a, b) => a.city.localeCompare(b.city) || byName(a, b));
+
+  const where = area === "all" ? "across BC" : `in ${area}`;
+
+  return (
+    <main className="wrap">
+      <section>
+        <h1>Courses near you</h1>
+        <p className="lede">Every golf course and pitch & putt we know of in BC. Pick one to host a game there.</p>
+      </section>
+
+      <section className="panel search" aria-label="Filter courses">
+        <Field id="c-area" label="Area">
+          <select id="c-area" value={area} onChange={(e) => setArea(e.target.value)}>
+            <option value="all">All of BC</option>
+            {AREAS.map((a) => (
+              <option key={a}>{a}</option>
+            ))}
+          </select>
+        </Field>
+        <div className="field">
+          <span className="label" id="c-type">
+            Type of golf
+          </span>
+          <div className="seg" role="group" aria-labelledby="c-type">
+            {[["any", "Any"], ...Object.entries(TYPES)].map(([val, label]) => (
+              <button key={val} aria-pressed={type === val} onClick={() => setType(val)}>
+                {label}
+              </button>
+            ))}
+          </div>
+        </div>
+        <Field id="c-search" label="Search by course or town" hint="Optional.">
+          <input id="c-search" type="text" autoComplete="off" value={query} onChange={(e) => setQuery(e.target.value)} />
+        </Field>
+      </section>
+
+      <h2 aria-live="polite">
+        {list.length} {list.length === 1 ? "course" : "courses"} {where}
+      </h2>
+
+      {list.length === 0 ? (
+        <section className="panel empty">
+          <p>No courses match. Try All of BC or Any type, or clear the search.</p>
+        </section>
+      ) : (
+        <ul className="courselist">
+          {list.map((c) => {
+            const count = gameCounts[courseKey(c.name)] || 0;
+            return (
+              <li key={c.name} className="course">
+                <div>
+                  <h3>{c.name}</h3>
+                  <p className="course-city">
+                    {c.city}
+                    {area === "all" && `, ${c.area}`}
+                  </p>
+                </div>
+                <div className="tags">
+                  {c.types.map((t) => (
+                    <span key={t} className="tag">
+                      {TYPES[t]}
+                    </span>
+                  ))}
+                  {c.access === "members" && <span className="tag">Members and guests only</span>}
+                  {c.note && <span className="tag stop">{c.note}</span>}
+                </div>
+                {count > 0 && (
+                  <p className="course-games">
+                    {count} upcoming {count === 1 ? "game" : "games"} here
+                  </p>
+                )}
+                <div className="course-actions">
+                  {count > 0 && (
+                    <button className="btn" onClick={() => onSeeGames(c)}>
+                      See {count === 1 ? "the game" : "the games"}
+                    </button>
+                  )}
+                  <button className={`btn${count > 0 ? " secondary" : ""}`} onClick={() => onHostHere(c)}>
+                    Host a game here
+                  </button>
+                </div>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+
+      <p className="muted">Don't see your course? You can type any course name when you host a game.</p>
     </main>
   );
 }
@@ -961,6 +1116,7 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [filters, setFilters] = useState({ area: "all", type: "any" });
+  const [hostPrefill, setHostPrefill] = useState(null); // { course, n } when hosting from the Courses page
 
   const loadGames = useCallback(async () => {
     const g = (await store.get(GAMES_KEY, true)) || [];
@@ -1015,34 +1171,6 @@ export default function App() {
     }
     return { error: "That didn't save. Check your internet connection and try again." };
   };
-
-  const samples = useMemo(() => {
-    const day = (n) => {
-      const x = new Date();
-      x.setDate(x.getDate() + n);
-      return toISODate(x);
-    };
-    return [
-      {
-        id: "sample-1", sample: true, course: "Queen Elizabeth Pitch & Putt", type: "pnp", area: "Metro Vancouver",
-        date: day(2), time: "10:00", totalSpots: 4, vibe: "fun", teeBooked: false,
-        meetAt: "By the starter's booth, 15 minutes before", note: "New to the area and happy to go slow and chat.",
-        hostId: "s-linda", players: [{ id: "s-linda", name: "Linda M." }], messages: [],
-      },
-      {
-        id: "sample-2", sample: true, course: "Fraserview Golf Course", type: "18", area: "Metro Vancouver",
-        date: day(4), time: "08:12", totalSpots: 4, vibe: "casual", teeBooked: true,
-        meetAt: "At the pro shop, 20 minutes before", note: "Walking, not riding. We play ready golf.",
-        hostId: "s-gord", players: [{ id: "s-gord", name: "Gord T." }, { id: "s-raj", name: "Raj P." }], messages: [],
-      },
-      {
-        id: "sample-3", sample: true, course: "Cedar Hill Golf Course", type: "9", area: "Victoria and South Island",
-        date: day(6), time: "15:30", totalSpots: 4, vibe: "keen", teeBooked: true,
-        meetAt: "At the pro shop, 15 minutes before", note: "",
-        hostId: "s-anne", players: [{ id: "s-anne", name: "Anne W." }, { id: "s-bev", name: "Bev K." }, { id: "s-tom", name: "Tom L." }], messages: [],
-      },
-    ];
-  }, []);
 
   // ----- Actions -----
 
@@ -1230,7 +1358,7 @@ export default function App() {
             <FlagMark />
             <div>
               <div className="wordmark">Putt Together</div>
-              <p className="tagline">Golf buddies across BC</p>
+              <p className="tagline">Find your people. Play a round.</p>
             </div>
           </div>
           <button className="textsize" aria-pressed={large} onClick={toggleText}>
@@ -1245,9 +1373,19 @@ export default function App() {
             {[
               ["find", "Find a game"],
               ["host", "Host a game"],
+              ["courses", "Courses"],
               ["mine", "My games"],
             ].map(([key, label]) => (
-              <button key={key} className="tab" aria-current={tab === key ? "page" : undefined} onClick={() => setTab(key)}>
+              <button
+                key={key}
+                className="tab"
+                aria-current={tab === key ? "page" : undefined}
+                onClick={() => {
+                  if (key === "host") setHostPrefill(null);
+                  if (key === "find") setFilters((x) => ({ ...x, course: "" }));
+                  setTab(key);
+                }}
+              >
                 {label}
               </button>
             ))}
@@ -1264,7 +1402,6 @@ export default function App() {
       ) : tab === "find" ? (
         <FindGames
           games={games}
-          samples={samples}
           me={me}
           filters={filters}
           setFilters={setFilters}
@@ -1278,7 +1415,20 @@ export default function App() {
           cardProps={cardProps}
         />
       ) : tab === "host" ? (
-        <HostGame me={me} onPost={postGame} />
+        <HostGame key={hostPrefill?.n || "host"} me={me} onPost={postGame} prefill={hostPrefill?.course} />
+      ) : tab === "courses" ? (
+        <CourseList
+          me={me}
+          games={games}
+          onHostHere={(c) => {
+            setHostPrefill({ course: c.name, n: Date.now() });
+            setTab("host");
+          }}
+          onSeeGames={(c) => {
+            setFilters({ area: c.area, type: "any", course: c.name });
+            setTab("find");
+          }}
+        />
       ) : (
         <MyGames
           games={games}
