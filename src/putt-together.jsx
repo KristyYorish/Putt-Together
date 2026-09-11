@@ -140,7 +140,7 @@ const displayName = (p) => (p.name || "").trim();
 const withName = (p) => {
   if (!p || p.name) return p;
   const first = (p.firstName || "").trim();
-  return { ...p, name: p.lastInitial ? `${first} ${p.lastInitial.toUpperCase()}.` : first };
+  return { ...p, name: p.lastInitial ? `${first} ${p.lastInitial.toUpperCase()}` : first };
 };
 const initials = (name) =>
   name
@@ -639,7 +639,7 @@ function FindGames({ games, me, filters, setFilters, onRefresh, refreshing, goHo
   return (
     <main className="wrap">
       <section>
-        <h1>Hi {me.name}.</h1>
+        <h1>Hi {me.name.replace(/\.$/, "")}.</h1>
         <p className="lede">Here's who's heading out. Tap Join on any game with an open spot.</p>
       </section>
 
