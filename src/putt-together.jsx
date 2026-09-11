@@ -135,7 +135,13 @@ const relDay = (s) => {
 };
 const fmtWhen = (at) =>
   new Date(at).toLocaleString("en-CA", { weekday: "short", hour: "numeric", minute: "2-digit" });
-const displayName = (p) => (p.lastInitial ? `${p.firstName.trim()} ${p.lastInitial.toUpperCase()}.` : p.firstName.trim());
+const displayName = (p) => (p.name || "").trim();
+// People who signed up before we switched to a single name field have firstName and lastInitial
+const withName = (p) => {
+  if (!p || p.name) return p;
+  const first = (p.firstName || "").trim();
+  return { ...p, name: p.lastInitial ? `${first} ${p.lastInitial.toUpperCase()}.` : first };
+};
 const initials = (name) =>
   name
     .replace(".", "")
@@ -149,7 +155,7 @@ const validEmail = (e) => /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(e.trim());
 
 function validateDetails(v) {
   const e = {};
-  if (!v.firstName.trim()) e.firstName = "Enter your first name.";
+  if (!v.name.trim()) e.name = "Enter the name you'd like other golfers to see.";
   if (!validEmail(v.email)) e.email = "Enter an email address like name@example.com.";
   if (!v.area) e.area = "Choose the area where you usually golf.";
   return e;
@@ -359,11 +365,8 @@ function DetailsFields({ v, set, errors }) {
   const up = (k) => (e) => set({ ...v, [k]: e.target.value });
   return (
     <>
-      <Field id="firstName" label="First name" error={errors.firstName}>
-        <input id="firstName" type="text" autoComplete="given-name" value={v.firstName} onChange={up("firstName")} aria-invalid={!!errors.firstName} />
-      </Field>
-      <Field id="lastInitial" label="First letter of your last name" hint="Optional. Helps tell two Daves apart.">
-        <input id="lastInitial" type="text" maxLength={1} autoComplete="off" value={v.lastInitial} onChange={up("lastInitial")} style={{ maxWidth: "5em" }} />
+      <Field id="name" label="Your name" hint="What other golfers will see. A first name, a nickname, whatever you like." error={errors.name}>
+        <input id="name" type="text" maxLength={40} autoComplete="nickname" value={v.name} onChange={up("name")} aria-invalid={!!errors.name} />
       </Field>
       <Field id="email" label="Email address" hint="Kept private. Other golfers never see it." error={errors.email}>
         <input id="email" type="email" inputMode="email" autoComplete="email" value={v.email} onChange={up("email")} aria-invalid={!!errors.email} />
@@ -562,7 +565,7 @@ function GameCard({ game, me, onJoin, onLeave, onCancel, onPostMessage }) {
 // ---------- Screens ----------
 
 function Onboarding({ onDone }) {
-  const [v, setV] = useState({ firstName: "", lastInitial: "", email: "", area: "" });
+  const [v, setV] = useState({ name: "", email: "", area: "" });
   const [newsletter, setNewsletter] = useState(false);
   const [errors, setErrors] = useState({});
   const [saving, setSaving] = useState(false);
@@ -615,7 +618,7 @@ function Onboarding({ onDone }) {
         <button className="btn" onClick={submit} disabled={saving}>
           {saving ? "Setting up…" : "Start finding games"}
         </button>
-        <p className="hint">Other golfers see your first name, last initial, and area. Nothing else.</p>
+        <p className="hint">Other golfers see your name and area. Nothing else.</p>
       </section>
     </main>
   );
@@ -636,7 +639,7 @@ function FindGames({ games, me, filters, setFilters, onRefresh, refreshing, goHo
   return (
     <main className="wrap">
       <section>
-        <h1>Hi {me.firstName}.</h1>
+        <h1>Hi {me.name}.</h1>
         <p className="lede">Here's who's heading out. Tap Join on any game with an open spot.</p>
       </section>
 
@@ -1023,7 +1026,7 @@ function MyGames({ games, me, goFind, goHost, cardProps, onSaveDetails, onSubscr
     .filter((g) => g.hostId !== me.id && g.players.some((p) => p.id === me.id))
     .sort((a, b) => gameStart(a) - gameStart(b));
   const [editing, setEditing] = useState(false);
-  const [v, setV] = useState({ firstName: me.firstName, lastInitial: me.lastInitial || "", email: me.email, area: me.area });
+  const [v, setV] = useState({ name: me.name, email: me.email, area: me.area });
   const [errors, setErrors] = useState({});
 
   const save = async () => {
@@ -1130,14 +1133,16 @@ export default function App() {
 
   useEffect(() => {
     (async () => {
-      const [p, t] = await Promise.all([store.get(PROFILE_KEY, false), store.get(TEXT_KEY, false)]);
+      const [saved, t] = await Promise.all([store.get(PROFILE_KEY, false), store.get(TEXT_KEY, false)]);
       if (t === "large") setLarge(true);
+      const p = withName(saved);
       if (p) {
-        setMe(p);
+        if (p !== saved) await saveMe(p);
+        else setMe(p);
         setFilters((f) => ({ ...f, area: p.area }));
         // Retry a newsletter sign-up that couldn't be sent earlier
         if (p.newsletter && !p.newsletterSynced && NEWSLETTER_ENDPOINT) {
-          const ok = await subscribeToNewsletter({ email: p.email, firstName: p.firstName, area: p.area });
+          const ok = await subscribeToNewsletter({ email: p.email, firstName: p.name, area: p.area });
           if (ok) saveMe({ ...p, newsletterSynced: true });
         }
       }
@@ -1177,19 +1182,18 @@ export default function App() {
   const handleOnboard = async (v, newsletter) => {
     const p = {
       id: uid(),
-      firstName: v.firstName.trim(),
-      lastInitial: v.lastInitial.trim(),
+      name: v.name.trim(),
       email: v.email.trim(),
       area: v.area,
       newsletter,
       newsletterSynced: false,
       joinedAt: Date.now(),
     };
-    if (newsletter) p.newsletterSynced = await subscribeToNewsletter({ email: p.email, firstName: p.firstName, area: p.area });
+    if (newsletter) p.newsletterSynced = await subscribeToNewsletter({ email: p.email, firstName: p.name, area: p.area });
     await saveMe(p);
     setFilters({ area: p.area, type: "any" });
     setTab("find");
-    setNotice({ text: `Welcome, ${p.firstName}. Here are the games in ${p.area}.` });
+    setNotice({ text: `Welcome, ${p.name}. Here are the games in ${p.area}.` });
   };
 
   const summary = (g) => (
@@ -1302,7 +1306,7 @@ export default function App() {
   };
 
   const saveDetails = async (v) => {
-    const next = { ...me, firstName: v.firstName.trim(), lastInitial: v.lastInitial.trim(), email: v.email.trim(), area: v.area };
+    const next = { ...me, name: v.name.trim(), email: v.email.trim(), area: v.area };
     await saveMe(next);
     const name = displayName(next);
     if (name !== displayName(me)) {
@@ -1314,7 +1318,7 @@ export default function App() {
   };
 
   const subscribe = async () => {
-    const synced = await subscribeToNewsletter({ email: me.email, firstName: me.firstName, area: me.area });
+    const synced = await subscribeToNewsletter({ email: me.email, firstName: me.name, area: me.area });
     await saveMe({ ...me, newsletter: true, newsletterSynced: synced });
     setNotice({ text: "You're signed up for the newsletter." });
   };
@@ -1446,7 +1450,7 @@ export default function App() {
         <div style={{ maxWidth: "38em", margin: "0 auto", padding: "0 1em 9em" }}>
           <footer className="foot">
             <p>Meet at the course, in public, and let someone know where you're playing.</p>
-            <p>Posted games and your first name are visible to everyone using Putt Together. Your email stays private.</p>
+            <p>Posted games and your name are visible to everyone using Putt Together. Your email stays private.</p>
             {!NEWSLETTER_ENDPOINT && (
               <p className="preview">
                 Preview mode: newsletter sign-ups are saved in the app but not sent to Beehiiv yet. Add your sign-up link at the top of the code to
