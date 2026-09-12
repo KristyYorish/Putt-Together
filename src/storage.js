@@ -1,29 +1,13 @@
-// Storage for Putt Together on Netlify.
+// Talks to Putt Together's server (netlify/functions/api.mjs) and keeps a
+// couple of small things in this browser (text size, and the details people
+// entered before sign-in existed, so they carry over).
 //
-// The app calls window.storage.get / set / delete (the same shape as Claude's
-// artifact storage). Here:
-//   - personal data (your profile, text size) stays in this browser
-//   - shared data (posted games) is saved on Netlify through /api/storage,
-//     so everyone sees the same list
-//
-// Each save sends a fingerprint of the list as it was when we last read it.
-// If someone else changed the list in the meantime, the server refuses the
-// save, and the app re-reads and tries again, so nobody's change gets lost.
+// Members are signed in with a cookie the server sets; the browser sends it
+// automatically, so nothing here handles passwords or tokens.
 
-const SHARED_URL = "/api/storage";
-const UNREADABLE = "unreadable"; // never matches, so a failed read can't lead to an overwrite
-
-const lastSeen = {}; // key -> fingerprint of the shared value we last read or wrote
 const memory = {}; // fallback when the browser blocks localStorage
 
-async function fingerprint(text) {
-  if (text == null) return "none";
-  const bytes = new TextEncoder().encode(text);
-  const hash = await crypto.subtle.digest("SHA-256", bytes);
-  return Array.from(new Uint8Array(hash), (b) => b.toString(16).padStart(2, "0")).join("");
-}
-
-const local = {
+export const localStore = {
   get(key) {
     try {
       return localStorage.getItem(key);
@@ -48,50 +32,46 @@ const local = {
   },
 };
 
-export function installStorage() {
-  if (window.storage) return; // already running somewhere that provides storage
-
-  window.storage = {
-    async get(key, shared) {
-      if (!shared) {
-        const value = local.get(key);
-        return value == null ? null : { key, value };
-      }
-      try {
-        const res = await fetch(`${SHARED_URL}?key=${encodeURIComponent(key)}`, { cache: "no-store" });
-        if (!res.ok) throw new Error(`Storage read failed (${res.status})`);
-        const { value } = await res.json();
-        lastSeen[key] = await fingerprint(value);
-        return value == null ? null : { key, value };
-      } catch (err) {
-        lastSeen[key] = UNREADABLE;
-        throw err;
-      }
-    },
-
-    async set(key, value, shared) {
-      if (!shared) {
-        local.set(key, value);
-        return { key, value };
-      }
-      const res = await fetch(SHARED_URL, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ key, value, base: lastSeen[key] }),
-      });
-      if (res.status === 409) {
-        lastSeen[key] = UNREADABLE;
-        return null; // changed by someone else: the app re-reads and retries
-      }
-      if (!res.ok) throw new Error(`Storage save failed (${res.status})`);
-      lastSeen[key] = await fingerprint(value);
-      return { key, value };
-    },
-
-    async delete(key, shared) {
-      if (shared) throw new Error("Shared items can't be deleted.");
-      local.remove(key);
-      return { key, deleted: true };
-    },
-  };
+async function call(path, { method = "GET", body } = {}) {
+  let res;
+  try {
+    res = await fetch(path, {
+      method,
+      headers: body !== undefined ? { "Content-Type": "application/json" } : {},
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+      credentials: "same-origin",
+      cache: "no-store",
+    });
+  } catch {
+    return { error: "Couldn't reach Putt Together. Check your internet connection and try again.", offline: true };
+  }
+  let data = {};
+  try {
+    data = await res.json();
+  } catch {
+    /* no body */
+  }
+  if (!res.ok) {
+    const firstFieldError = data.errors && typeof data.errors === "object" ? Object.values(data.errors)[0] : null;
+    return {
+      error: data.error || firstFieldError || (res.status === 401 ? "Please sign in." : "Something went wrong. Try again."),
+      errors: data.errors,
+      status: res.status,
+    };
+  }
+  return data;
 }
+
+export const api = {
+  requestLink: (email, legacy) => call("/api/login", { method: "POST", body: { email, legacy } }),
+  signInWithCode: (email, code) => call("/api/login/code", { method: "POST", body: { email, code } }),
+  signOut: () => call("/api/logout", { method: "POST", body: {} }),
+  me: () => call("/api/me"),
+  updateMe: (fields) => call("/api/me", { method: "PUT", body: fields }),
+  games: () => call("/api/games"),
+  postGame: (game) => call("/api/games", { method: "POST", body: game }),
+  gameAction: (id, action, body = {}) => call(`/api/games/${encodeURIComponent(id)}/${action}`, { method: "POST", body }),
+  answer: (gameId, playerId, answer) => call("/api/answer", { method: "POST", body: { gameId, playerId, answer } }),
+  skip: (gameId) => call("/api/skip", { method: "POST", body: { gameId } }),
+  unhide: (playerId) => call("/api/unhide", { method: "POST", body: { playerId } }),
+};
