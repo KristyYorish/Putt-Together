@@ -47,8 +47,14 @@ const bestType = (c) => (c.types.includes("18") ? "18" : c.types.includes("9") ?
 const byName = (a, b) => a.name.replace(/^The /, "").localeCompare(b.name.replace(/^The /, ""));
 
 const GAMES_KEY = "putt-games-v1"; // shared: everyone sees posted games
+const HIDES_KEY = "putt-hides-v1"; // shared: pairs of golfers who won't see each other's games (fingerprints only, no names)
 const PROFILE_KEY = "putt-profile-v1"; // personal: only this person
 const TEXT_KEY = "putt-textsize-v1"; // personal
+const PLAYED_KEY = "putt-played-v1"; // personal: games you were in, so we can ask how they went
+
+// Pictures: the default is your initial. These are the emoji choices.
+const EMOJIS = ["⛳", "🏌️", "🌲", "🍁", "☀️", "🌈", "🐻", "🦅", "🦆", "🐦", "🌊", "⛰️", "☕", "🍺", "🐕", "🌷"];
+const PHOTO_SIZE = 120; // photos are shrunk to this many pixels square before they're saved
 
 // ---------- Storage (Claude artifact storage, with an in-memory fallback) ----------
 
@@ -152,6 +158,64 @@ const initials = (name) =>
     .slice(0, 2)
     .toUpperCase();
 const validEmail = (e) => /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(e.trim());
+
+// ----- Pictures -----
+
+// A person's picture: { kind: "letter" } (their initial), { kind: "emoji", emoji }, or { kind: "photo", photo } (a small data URL)
+const avatarOf = (p) => (p?.avatar && (p.avatar.kind === "emoji" || p.avatar.kind === "photo") ? p.avatar : { kind: "letter" });
+// What travels with your name into posted games. The initial needs no data, so it's left out.
+const publicAvatar = (p) => (avatarOf(p).kind === "letter" ? undefined : avatarOf(p));
+
+// Shrinks a photo to a small square in the browser, so the list of games stays quick to load.
+async function shrinkPhoto(file) {
+  if (!file || !file.type.startsWith("image/")) throw new Error("Choose a photo file, like a JPG or PNG.");
+  let img;
+  try {
+    img = await createImageBitmap(file, { imageOrientation: "from-image" });
+  } catch {
+    img = await new Promise((resolve, reject) => {
+      const url = URL.createObjectURL(file);
+      const el = new Image();
+      el.onload = () => {
+        URL.revokeObjectURL(url);
+        resolve(el);
+      };
+      el.onerror = () => {
+        URL.revokeObjectURL(url);
+        reject(new Error("That photo couldn't be opened. Try a JPG or PNG."));
+      };
+      el.src = url;
+    });
+  }
+  const w = img.naturalWidth || img.width;
+  const h = img.naturalHeight || img.height;
+  const side = Math.min(w, h);
+  const canvas = document.createElement("canvas");
+  canvas.width = canvas.height = PHOTO_SIZE;
+  canvas.getContext("2d").drawImage(img, (w - side) / 2, (h - side) / 2, side, side, 0, 0, PHOTO_SIZE, PHOTO_SIZE);
+  if (img.close) img.close();
+  return canvas.toDataURL("image/jpeg", 0.8);
+}
+
+// ----- Hiding golfers from each other -----
+
+// A short fingerprint for a pair of golfers. The shared hide list holds only these, never names or ids.
+const fnv = (s, seed) => {
+  let h = seed >>> 0;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619) >>> 0;
+  }
+  return h.toString(16).padStart(8, "0");
+};
+const pairKey = (a, b) => {
+  const s = [a, b].sort().join("|");
+  return fnv(s, 0x811c9dc5) + fnv(s, 0x01000193);
+};
+const hiddenFromMe = (game, meId, hides) => game.players.some((p) => p.id !== meId && hides.has(pairKey(meId, p.id)));
+// Ask how a game went once the tee time is well past
+const gameOver = (g) => Date.now() > gameStart(g).getTime() + 90 * 60 * 1000;
+const PLAYED_KEEP_DAYS = 14;
 
 function validateDetails(v) {
   const e = {};
@@ -261,11 +325,27 @@ const css = `
 .group-label { font-weight: 700; margin-bottom: .45em; }
 .seats { display: flex; flex-wrap: wrap; gap: .6em; }
 .seat { width: 4.6em; display: flex; flex-direction: column; align-items: center; gap: .25em; text-align: center; }
-.ball { width: 2.9em; height: 2.9em; border-radius: 50%; display: grid; place-items: center; font-weight: 700; background: var(--fairway); color: #fff; }
+.ball { width: 2.9em; height: 2.9em; border-radius: 50%; display: grid; place-items: center; font-weight: 700; background: var(--fairway); color: #fff; flex: none; }
 .ball.you { background: var(--flag); color: var(--ink); }
 .ball.open { background: #fff; border: 3px dashed var(--fairway); color: var(--fairway); font-size: .85em; }
+.ball.emoji { background: var(--tint); border: 2px solid var(--line); font-size: 1.5em; line-height: 1; }
+.ball.emoji.you { background: var(--flag); border-color: var(--flag); }
+.ball.photo { overflow: hidden; background: var(--tint); }
+.ball.photo.you { box-shadow: 0 0 0 3px var(--flag); }
+.ball img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .seat-name { font-size: .85em; line-height: 1.2; overflow-wrap: anywhere; }
 .seat-role { font-size: .8em; color: var(--muted); }
+
+.pick { display: flex; align-items: center; gap: .8em; flex-wrap: wrap; }
+.pick .ball { width: 3.6em; height: 3.6em; font-size: 1.1em; }
+.emojis { display: grid; grid-template-columns: repeat(auto-fill, minmax(3.4em, 1fr)); gap: .4em; }
+.emojis button { font: inherit; font-size: 1.6em; line-height: 1; min-height: 2.1em; border-radius: 12px; border: 2px solid var(--line); background: #fff; cursor: pointer; }
+.emojis button[aria-pressed="true"] { border-color: var(--fairway); background: var(--tint); box-shadow: inset 0 0 0 2px var(--fairway); }
+
+.people { list-style: none; margin: 0; padding: 0; display: grid; gap: .8em; }
+.people li { display: flex; align-items: center; gap: .7em; flex-wrap: wrap; }
+.person-name { font-weight: 700; flex: 1; min-width: 6em; overflow-wrap: anywhere; }
+.people .seg { flex: none; }
 
 .hostnote { border-left: 5px solid var(--flag); padding: .2em 0 .2em .8em; }
 .status { display: flex; align-items: center; gap: .5em; font-weight: 700; color: var(--fairway-dark); }
@@ -361,13 +441,79 @@ function Choices({ name, legend, hint, options, value, onChange, row }) {
   );
 }
 
-function DetailsFields({ v, set, errors }) {
+// A person's picture: their initial, an emoji, or a small photo
+function Ball({ person, you }) {
+  const a = avatarOf(person);
+  return (
+    <span className={`ball${you ? " you" : ""}${a.kind !== "letter" ? ` ${a.kind}` : ""}`} aria-hidden="true">
+      {a.kind === "photo" ? <img src={a.photo} alt="" /> : a.kind === "emoji" ? a.emoji : initials(person.name || "")}
+    </span>
+  );
+}
+
+function AvatarPicker({ name, value, onChange }) {
+  const a = avatarOf({ avatar: value });
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const fileRef = useRef(null);
+
+  const pickFile = async (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    setBusy(true);
+    setError("");
+    try {
+      onChange({ kind: "photo", photo: await shrinkPhoto(file) });
+    } catch (err) {
+      setError(err.message || "That photo didn't work. Try another one.");
+    }
+    setBusy(false);
+  };
+
+  return (
+    <div className="field">
+      <span className="label" id="pic-label">
+        Your picture
+      </span>
+      <p className="hint">Shown next to your name. Your initial is fine, or pick an emoji or add a photo.</p>
+      <div className="pick">
+        <Ball person={{ name, avatar: a }} />
+        <div className="seg" role="group" aria-labelledby="pic-label">
+          <button type="button" aria-pressed={a.kind === "letter"} onClick={() => onChange({ kind: "letter" })}>
+            My initial
+          </button>
+          <button type="button" aria-pressed={a.kind === "emoji"} onClick={() => onChange({ kind: "emoji", emoji: a.kind === "emoji" ? a.emoji : EMOJIS[0] })}>
+            An emoji
+          </button>
+          <button type="button" aria-pressed={a.kind === "photo"} onClick={() => fileRef.current?.click()} disabled={busy}>
+            {busy ? "One moment…" : a.kind === "photo" ? "A different photo" : "A photo"}
+          </button>
+        </div>
+      </div>
+      {a.kind === "emoji" && (
+        <div className="emojis" role="group" aria-label="Choose an emoji">
+          {EMOJIS.map((e) => (
+            <button type="button" key={e} aria-pressed={a.emoji === e} onClick={() => onChange({ kind: "emoji", emoji: e })} aria-label={`Emoji ${e}`}>
+              {e}
+            </button>
+          ))}
+        </div>
+      )}
+      <input ref={fileRef} type="file" accept="image/*" hidden onChange={pickFile} aria-label="Choose a photo" />
+      {error && <p className="error">{error}</p>}
+    </div>
+  );
+}
+
+function DetailsFields({ v, set, errors, withPicture }) {
   const up = (k) => (e) => set({ ...v, [k]: e.target.value });
   return (
     <>
       <Field id="name" label="Your name" hint="What other golfers will see. A first name, a nickname, whatever you like." error={errors.name}>
         <input id="name" type="text" maxLength={40} autoComplete="nickname" value={v.name} onChange={up("name")} aria-invalid={!!errors.name} />
       </Field>
+      {withPicture && <AvatarPicker name={v.name} value={v.avatar} onChange={(avatar) => set({ ...v, avatar })} />}
       <Field id="email" label="Email address" hint="Kept private. Other golfers never see it." error={errors.email}>
         <input id="email" type="email" inputMode="email" autoComplete="email" value={v.email} onChange={up("email")} aria-invalid={!!errors.email} />
       </Field>
@@ -510,9 +656,7 @@ function GameCard({ game, me, onJoin, onLeave, onCancel, onPostMessage }) {
             {seats.map((p, i) =>
               p ? (
                 <div className="seat" key={p.id}>
-                  <span className={`ball${p.id === me.id ? " you" : ""}`} aria-hidden="true">
-                    {initials(p.name)}
-                  </span>
+                  <Ball person={p} you={p.id === me.id} />
                   <span className="seat-name">{p.id === me.id ? "You" : p.name}</span>
                   {i === 0 && <span className="seat-role">Host</span>}
                 </div>
@@ -624,7 +768,65 @@ function Onboarding({ onDone }) {
   );
 }
 
-function FindGames({ games, me, filters, setFilters, onRefresh, refreshing, goHost, cardProps }) {
+// Shown once on Find a game until you pick a picture or say Not now
+function PicturePanel({ me, onSave, onSkip }) {
+  const [avatar, setAvatar] = useState(me.avatar);
+  const [saving, setSaving] = useState(false);
+  return (
+    <section className="panel" aria-labelledby="pic-h">
+      <h2 id="pic-h">Add a picture?</h2>
+      <p>It helps people recognize you at the course. Your initial works too.</p>
+      <AvatarPicker name={me.name} value={avatar} onChange={setAvatar} />
+      <div className="actions">
+        <button
+          className="btn"
+          disabled={saving}
+          onClick={async () => {
+            setSaving(true);
+            await onSave(avatarOf({ avatar }));
+            setSaving(false);
+          }}
+        >
+          {saving ? "Saving…" : "Save my picture"}
+        </button>
+        <button className="linkbtn" onClick={onSkip}>
+          Not now
+        </button>
+      </div>
+    </section>
+  );
+}
+
+// After a game, a private question about each person you played with
+function HowDidItGo({ game, onAnswer, onSkip }) {
+  const pending = game.players.filter((p) => !game.answered?.[p.id]);
+  return (
+    <section className="panel" aria-labelledby="how-h">
+      <h2 id="how-h">How was your game at {game.course}?</h2>
+      <p>
+        {fmtLongDate(game.date)}. Would you play with them again? Your answers are private.
+      </p>
+      <ul className="people">
+        {pending.map((p) => (
+          <li key={p.id}>
+            <Ball person={p} />
+            <span className="person-name">{p.name}</span>
+            <div className="seg" role="group" aria-label={`Would you play with ${p.name} again?`}>
+              <button onClick={() => onAnswer(game, p, "yes")}>Yes, happily</button>
+              <button onClick={() => onAnswer(game, p, "no")}>Rather not</button>
+            </div>
+          </li>
+        ))}
+      </ul>
+      <p className="hint">Rather not means the two of you won't see each other's games from now on. Nobody is told.</p>
+      <button className="linkbtn" onClick={() => onSkip(game)}>
+        Skip this
+      </button>
+    </section>
+  );
+}
+
+function FindGames({ games, me, filters, setFilters, onRefresh, refreshing, goHost, cardProps, toAsk, askProps, showPicture, pictureProps }) {
   const live = games.filter((g) => !g.cancelled);
   const list = live
     .filter(
@@ -642,6 +844,8 @@ function FindGames({ games, me, filters, setFilters, onRefresh, refreshing, goHo
         <h1>Hi {me.name.replace(/\.$/, "")}.</h1>
         <p className="lede">Here's who's heading out. Tap Join on any game with an open spot.</p>
       </section>
+
+      {toAsk ? <HowDidItGo game={toAsk} {...askProps} /> : showPicture ? <PicturePanel me={me} {...pictureProps} /> : null}
 
       <section className="panel filters" aria-label="Filter games">
         <Field id="f-area" label="Area">
@@ -1020,14 +1224,15 @@ function NewsletterPanel({ me, onSubscribe }) {
   );
 }
 
-function MyGames({ games, me, goFind, goHost, cardProps, onSaveDetails, onSubscribe, onStartOver }) {
+function MyGames({ games, me, goFind, goHost, cardProps, onSaveDetails, onSubscribe, onStartOver, onUnhide }) {
   const hosting = games.filter((g) => g.hostId === me.id && !g.cancelled).sort((a, b) => gameStart(a) - gameStart(b));
   const joined = games
     .filter((g) => g.hostId !== me.id && g.players.some((p) => p.id === me.id))
     .sort((a, b) => gameStart(a) - gameStart(b));
   const [editing, setEditing] = useState(false);
-  const [v, setV] = useState({ name: me.name, email: me.email, area: me.area });
+  const [v, setV] = useState({ name: me.name, email: me.email, area: me.area, avatar: me.avatar });
   const [errors, setErrors] = useState({});
+  const hidden = me.hidden || [];
 
   const save = async () => {
     const e = validateDetails(v);
@@ -1072,7 +1277,7 @@ function MyGames({ games, me, goFind, goHost, cardProps, onSaveDetails, onSubscr
         <h2>Your details</h2>
         {editing ? (
           <>
-            <DetailsFields v={v} set={setV} errors={errors} />
+            <DetailsFields v={v} set={setV} errors={errors} withPicture />
             <button className="btn" onClick={save}>
               Save changes
             </button>
@@ -1085,6 +1290,10 @@ function MyGames({ games, me, goFind, goHost, cardProps, onSaveDetails, onSubscr
             <dl className="facts">
               <dt>Name</dt>
               <dd>{displayName(me)}</dd>
+              <dt>Picture</dt>
+              <dd>
+                <Ball person={me} />
+              </dd>
               <dt>Email</dt>
               <dd style={{ overflowWrap: "anywhere" }}>{me.email}</dd>
               <dt>Area</dt>
@@ -1096,6 +1305,23 @@ function MyGames({ games, me, goFind, goHost, cardProps, onSaveDetails, onSubscr
           </>
         )}
       </section>
+
+      {hidden.length > 0 && (
+        <section className="panel" aria-labelledby="hidden-h">
+          <h2 id="hidden-h">Golfers you've hidden</h2>
+          <p className="hint">You don't see each other's games. They weren't told.</p>
+          <ul className="people">
+            {hidden.map((p) => (
+              <li key={p.id}>
+                <span className="person-name">{p.name}</span>
+                <button className="linkbtn" onClick={() => onUnhide(p)}>
+                  Unhide
+                </button>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
 
       <NewsletterPanel me={me} onSubscribe={onSubscribe} />
 
@@ -1120,10 +1346,13 @@ export default function App() {
   const [refreshing, setRefreshing] = useState(false);
   const [filters, setFilters] = useState({ area: "all", type: "any" });
   const [hostPrefill, setHostPrefill] = useState(null); // { course, n } when hosting from the Courses page
+  const [hides, setHides] = useState(() => new Set()); // shared fingerprints of pairs who don't see each other's games
+  const [played, setPlayed] = useState([]); // games you were in, kept on this device so we can ask how they went
 
   const loadGames = useCallback(async () => {
-    const g = (await store.get(GAMES_KEY, true)) || [];
-    setGames(g.filter(isUpcoming));
+    const [g, h] = await Promise.all([store.get(GAMES_KEY, true), store.get(HIDES_KEY, true)]);
+    setGames((g || []).filter(isUpcoming));
+    setHides(new Set(Array.isArray(h) ? h : []));
   }, []);
 
   const saveMe = useCallback(async (p) => {
@@ -1133,8 +1362,9 @@ export default function App() {
 
   useEffect(() => {
     (async () => {
-      const [saved, t] = await Promise.all([store.get(PROFILE_KEY, false), store.get(TEXT_KEY, false)]);
+      const [saved, t, pl] = await Promise.all([store.get(PROFILE_KEY, false), store.get(TEXT_KEY, false), store.get(PLAYED_KEY, false)]);
       if (t === "large") setLarge(true);
+      if (Array.isArray(pl)) setPlayed(pl);
       const p = withName(saved);
       if (p) {
         if (p !== saved) await saveMe(p);
@@ -1156,28 +1386,67 @@ export default function App() {
     window.scrollTo({ top: 0 });
   }, [tab]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Remember the games you're in (and who else is in them) on this device.
+  // Past games drop off the shared list, so this is how we can still ask how they went.
+  useEffect(() => {
+    if (!me) return;
+    const byId = new Map(played.map((g) => [g.id, g]));
+    let changed = false;
+    for (const g of games) {
+      const old = byId.get(g.id);
+      const inIt = !g.cancelled && g.players.some((p) => p.id === me.id) && g.players.length > 1;
+      if (inIt) {
+        const players = g.players.filter((p) => p.id !== me.id).map(({ id, name, avatar }) => ({ id, name, avatar }));
+        const next = { ...(old || {}), id: g.id, course: g.course, date: g.date, time: g.time, players };
+        if (JSON.stringify(next) !== JSON.stringify(old)) {
+          byId.set(g.id, next);
+          changed = true;
+        }
+      } else if (old) {
+        byId.delete(g.id);
+        changed = true;
+      }
+    }
+    const cutoff = Date.now() - PLAYED_KEEP_DAYS * 86400000;
+    for (const [id, g] of byId) {
+      if (gameStart(g).getTime() < cutoff) {
+        byId.delete(id);
+        changed = true;
+      }
+    }
+    if (!changed) return;
+    const list = [...byId.values()];
+    setPlayed(list);
+    store.set(PLAYED_KEY, list, false);
+  }, [games, me, played]);
+
   // Always re-read the latest list before changing it, so two people joining
   // at once don't overwrite each other.
-  const mutateGames = async (fn) => {
+  const mutateShared = async (key, fn, setter, clean = (x) => x) => {
     // If someone else changed the list at the same moment, the save is
     // refused, so we re-read and try again (up to 3 times).
     for (let attempt = 0; attempt < 3; attempt++) {
-      const latest = ((await store.get(GAMES_KEY, true)) || []).filter(isUpcoming);
+      const latest = clean((await store.get(key, true)) || []);
       const result = fn(latest);
       if (result.error) {
-        setGames(latest);
+        setter(latest);
         return { error: result.error };
       }
-      const ok = await store.set(GAMES_KEY, result.next, true);
+      const ok = await store.set(key, result.next, true);
       if (ok) {
-        setGames(result.next);
+        setter(result.next);
         return { ok: true };
       }
     }
     return { error: "That didn't save. Check your internet connection and try again." };
   };
+  const mutateGames = (fn) => mutateShared(GAMES_KEY, fn, setGames, (list) => list.filter(isUpcoming));
+  const mutateHides = (fn) => mutateShared(HIDES_KEY, fn, (list) => setHides(new Set(list)));
 
   // ----- Actions -----
+
+  // Your name and picture as they appear in posted games
+  const asPlayer = (p) => ({ id: p.id, name: displayName(p), avatar: publicAvatar(p) });
 
   const handleOnboard = async (v, newsletter) => {
     const p = {
@@ -1225,7 +1494,7 @@ export default function App() {
           if (!g || g.cancelled) return { error: "The host cancelled this game." };
           if (g.players.some((p) => p.id === me.id)) return { next: list };
           if (g.players.length >= g.totalSpots) return { error: "Someone just took the last spot. This game is now full." };
-          return { next: list.map((x) => (x.id === g.id ? { ...x, players: [...x.players, { id: me.id, name: displayName(me) }] } : x)) };
+          return { next: list.map((x) => (x.id === g.id ? { ...x, players: [...x.players, asPlayer(me)] } : x)) };
         });
         return res.error
           ? { kind: "error", text: res.error }
@@ -1290,7 +1559,7 @@ export default function App() {
       ...f,
       id: uid(),
       hostId: me.id,
-      players: [{ id: me.id, name: displayName(me) }],
+      players: [asPlayer(me)],
       messages: [],
       createdAt: Date.now(),
     };
@@ -1305,16 +1574,85 @@ export default function App() {
     return true;
   };
 
+  // Update your name and picture in every game you're in
+  const updateMyEntries = (next) =>
+    mutateGames((list) => ({
+      next: list.map((g) => ({ ...g, players: g.players.map((p) => (p.id === me.id ? asPlayer(next) : p)) })),
+    }));
+
   const saveDetails = async (v) => {
-    const next = { ...me, name: v.name.trim(), email: v.email.trim(), area: v.area };
+    const next = { ...me, name: v.name.trim(), email: v.email.trim(), area: v.area, avatar: avatarOf({ avatar: v.avatar }) };
     await saveMe(next);
-    const name = displayName(next);
-    if (name !== displayName(me)) {
-      await mutateGames((list) => ({
-        next: list.map((g) => ({ ...g, players: g.players.map((p) => (p.id === me.id ? { ...p, name } : p)) })),
-      }));
+    if (displayName(next) !== displayName(me) || JSON.stringify(publicAvatar(next)) !== JSON.stringify(publicAvatar(me))) {
+      await updateMyEntries(next);
     }
     setNotice({ text: "Your details are saved." });
+  };
+
+  const savePicture = async (avatar) => {
+    const next = { ...me, avatar };
+    await saveMe(next);
+    if (JSON.stringify(publicAvatar(next)) !== JSON.stringify(publicAvatar(me))) await updateMyEntries(next);
+    setNotice({ text: avatar.kind === "letter" ? "Your initial it is." : "Your picture is saved." });
+  };
+
+  // ----- Hiding golfers from each other -----
+
+  const markAnswered = (game, p, answer) =>
+    setPlayed((prev) => {
+      const list = prev.map((g) => (g.id === game.id ? { ...g, answered: { ...(g.answered || {}), [p.id]: answer } } : g));
+      store.set(PLAYED_KEY, list, false);
+      return list;
+    });
+
+  const hideGolfer = async (p) => {
+    const k = pairKey(me.id, p.id);
+    const res = await mutateHides((list) => ({ next: list.includes(k) ? list : [...list, k] }));
+    if (res.error) return res;
+    const hidden = [...(me.hidden || []).filter((x) => x.id !== p.id), { id: p.id, name: p.name, at: Date.now() }];
+    await saveMe({ ...me, hidden });
+    return { ok: true };
+  };
+
+  const answerGame = (game, p, answer) => {
+    if (answer === "yes") {
+      markAnswered(game, p, "yes");
+      return;
+    }
+    setDialog({
+      title: `Rather not play with ${p.name} again?`,
+      body: (
+        <p>
+          The two of you won't see each other's games from now on. {p.name} isn't told. You can undo this later under My games.
+        </p>
+      ),
+      confirmLabel: "Yes, I'd rather not",
+      danger: true,
+      onConfirm: async () => {
+        const res = await hideGolfer(p);
+        if (res.error) return { kind: "error", text: res.error };
+        markAnswered(game, p, "no");
+        return { text: `Done. You and ${p.name} won't see each other's games.` };
+      },
+    });
+  };
+
+  const skipGame = (game) =>
+    setPlayed((prev) => {
+      const list = prev.map((g) => (g.id === game.id ? { ...g, skipped: true } : g));
+      store.set(PLAYED_KEY, list, false);
+      return list;
+    });
+
+  const unhideGolfer = async (p) => {
+    const k = pairKey(me.id, p.id);
+    const res = await mutateHides((list) => ({ next: list.filter((x) => x !== k) }));
+    if (res.error) {
+      setNotice({ kind: "error", text: res.error });
+      return;
+    }
+    await saveMe({ ...me, hidden: (me.hidden || []).filter((x) => x.id !== p.id) });
+    setNotice({ text: `${p.name} can see your games again, and you theirs.` });
   };
 
   const subscribe = async () => {
@@ -1330,7 +1668,8 @@ export default function App() {
       confirmLabel: "Yes, remove my details",
       danger: true,
       onConfirm: async () => {
-        await store.del(PROFILE_KEY, false);
+        await Promise.all([store.del(PROFILE_KEY, false), store.del(PLAYED_KEY, false)]);
+        setPlayed([]);
         setMe(null);
         return { text: "Your details were removed from this device." };
       },
@@ -1351,6 +1690,14 @@ export default function App() {
   };
 
   const cardProps = { onJoin: askJoin, onLeave: askLeave, onCancel: askCancel, onPostMessage: postMessage };
+
+  // Games involving someone you've hidden (or who hid you) are left out of Find a game and Courses
+  const visible = useMemo(() => (me ? games.filter((g) => !hiddenFromMe(g, me.id, hides)) : games), [games, hides, me]);
+  // The next past game to ask about, one at a time
+  const toAsk = useMemo(
+    () => played.filter((g) => gameOver(g) && !g.skipped && g.players.some((p) => !g.answered?.[p.id])).sort((a, b) => gameStart(a) - gameStart(b))[0] || null,
+    [played]
+  );
 
   return (
     <div className={`pt${large ? " large" : ""}`}>
@@ -1405,7 +1752,7 @@ export default function App() {
         <Onboarding onDone={handleOnboard} />
       ) : tab === "find" ? (
         <FindGames
-          games={games}
+          games={visible}
           me={me}
           filters={filters}
           setFilters={setFilters}
@@ -1417,13 +1764,17 @@ export default function App() {
           }}
           goHost={() => setTab("host")}
           cardProps={cardProps}
+          toAsk={toAsk}
+          askProps={{ onAnswer: answerGame, onSkip: skipGame }}
+          showPicture={!me.avatar && !me.pictureAsked}
+          pictureProps={{ onSave: savePicture, onSkip: () => saveMe({ ...me, pictureAsked: true }) }}
         />
       ) : tab === "host" ? (
         <HostGame key={hostPrefill?.n || "host"} me={me} onPost={postGame} prefill={hostPrefill?.course} />
       ) : tab === "courses" ? (
         <CourseList
           me={me}
-          games={games}
+          games={visible}
           onHostHere={(c) => {
             setHostPrefill({ course: c.name, n: Date.now() });
             setTab("host");
@@ -1443,6 +1794,7 @@ export default function App() {
           onSaveDetails={saveDetails}
           onSubscribe={subscribe}
           onStartOver={startOver}
+          onUnhide={unhideGolfer}
         />
       )}
 
@@ -1450,7 +1802,7 @@ export default function App() {
         <div style={{ maxWidth: "38em", margin: "0 auto", padding: "0 1em 9em" }}>
           <footer className="foot">
             <p>Meet at the course, in public, and let someone know where you're playing.</p>
-            <p>Posted games and your name are visible to everyone using Putt Together. Your email stays private.</p>
+            <p>Posted games, your name, and your picture (if you add one) are visible to everyone using Putt Together. Your email stays private.</p>
             {!NEWSLETTER_ENDPOINT && (
               <p className="preview">
                 Preview mode: newsletter sign-ups are saved in the app but not sent to Beehiiv yet. Add your sign-up link at the top of the code to
