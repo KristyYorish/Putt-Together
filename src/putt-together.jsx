@@ -1,18 +1,18 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import { COURSES } from "./courses.js";
+import { api, localStore } from "./storage.js";
 
 /*
   PUTT TOGETHER — find people to golf with across BC
 
-  Newsletter (Beehiiv) setup:
-  Beehiiv's API key must never live in browser code (anyone could read it and
-  edit your subscriber list). So this app sends sign-ups to a small server
-  function, and that function talks to Beehiiv. See netlify/functions/subscribe.mjs.
-  Add BEEHIIV_API_KEY and BEEHIIV_PUBLICATION_ID in Netlify's environment
-  variables to switch it on. Until then, sign-ups are kept and retried later.
+  Members sign in with their email address (a link or a 6-digit code, no
+  password). The server, netlify/functions/api.mjs, keeps members and games
+  and only shows each member the games they should see. src/storage.js is the
+  thin layer that talks to it.
 
-  Shared storage: posted games are saved with netlify/functions/storage.mjs.
-  See src/storage.js.
+  Newsletter (Beehiiv): sign-ups go through netlify/functions/subscribe.mjs so
+  the API key never lives in browser code. Add BEEHIIV_API_KEY and
+  BEEHIIV_PUBLICATION_ID in Netlify's environment variables to switch it on.
 */
 const NEWSLETTER_ENDPOINT = "/api/subscribe";
 
@@ -46,54 +46,13 @@ const findCourse = (name) => COURSE_BY_NAME.get(courseKey(name || ""));
 const bestType = (c) => (c.types.includes("18") ? "18" : c.types.includes("9") ? "9" : "pnp");
 const byName = (a, b) => a.name.replace(/^The /, "").localeCompare(b.name.replace(/^The /, ""));
 
-const GAMES_KEY = "putt-games-v1"; // shared: everyone sees posted games
-const HIDES_KEY = "putt-hides-v1"; // shared: pairs of golfers who won't see each other's games (fingerprints only, no names)
-const PROFILE_KEY = "putt-profile-v1"; // personal: only this person
+const LEGACY_PROFILE_KEY = "putt-profile-v1"; // details entered before sign-in existed, kept in this browser
 const TEXT_KEY = "putt-textsize-v1"; // personal
-const PLAYED_KEY = "putt-played-v1"; // personal: games you were in, so we can ask how they went
+const EMAIL_KEY = "putt-email-v1"; // the address you last signed in with, to save typing
 
 // Pictures: the default is your initial. These are the emoji choices.
 const EMOJIS = ["⛳", "🏌️", "🌲", "🍁", "☀️", "🌈", "🐻", "🦅", "🦆", "🐦", "🌊", "⛰️", "☕", "🍺", "🐕", "🌷"];
 const PHOTO_SIZE = 120; // photos are shrunk to this many pixels square before they're saved
-
-// ---------- Storage (Claude artifact storage, with an in-memory fallback) ----------
-
-const memoryStore = {};
-const store = {
-  async get(key, shared) {
-    if (typeof window === "undefined" || !window.storage) return memoryStore[`${shared}:${key}`] ?? null;
-    try {
-      const r = await window.storage.get(key, shared);
-      return r ? JSON.parse(r.value) : null;
-    } catch {
-      return null;
-    }
-  },
-  async set(key, value, shared) {
-    if (typeof window === "undefined" || !window.storage) {
-      memoryStore[`${shared}:${key}`] = value;
-      return true;
-    }
-    try {
-      const r = await window.storage.set(key, JSON.stringify(value), shared);
-      return !!r;
-    } catch {
-      return false;
-    }
-  },
-  async del(key, shared) {
-    if (typeof window === "undefined" || !window.storage) {
-      delete memoryStore[`${shared}:${key}`];
-      return true;
-    }
-    try {
-      await window.storage.delete(key, shared);
-      return true;
-    } catch {
-      return false;
-    }
-  },
-};
 
 async function subscribeToNewsletter({ email, firstName, area }) {
   if (!NEWSLETTER_ENDPOINT) return false;
@@ -111,7 +70,6 @@ async function subscribeToNewsletter({ email, firstName, area }) {
 
 // ---------- Helpers ----------
 
-const uid = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
 const pad = (n) => String(n).padStart(2, "0");
 const toISODate = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 const parseDate = (s) => {
@@ -142,12 +100,18 @@ const relDay = (s) => {
 const fmtWhen = (at) =>
   new Date(at).toLocaleString("en-CA", { weekday: "short", hour: "numeric", minute: "2-digit" });
 const displayName = (p) => (p.name || "").trim();
-// People who signed up before we switched to a single name field have firstName and lastInitial
-const withName = (p) => {
-  if (!p || p.name) return p;
-  const first = (p.firstName || "").trim();
-  return { ...p, name: p.lastInitial ? `${first} ${p.lastInitial.toUpperCase()}` : first };
-};
+// Details saved in this browser before sign-in existed. Older ones have firstName and lastInitial.
+function legacyProfile() {
+  try {
+    const p = JSON.parse(localStore.get(LEGACY_PROFILE_KEY) || "null");
+    if (!p || typeof p !== "object") return null;
+    if (p.name) return p;
+    const first = (p.firstName || "").trim();
+    return { ...p, name: p.lastInitial ? `${first} ${p.lastInitial.toUpperCase()}` : first };
+  } catch {
+    return null;
+  }
+}
 const initials = (name) =>
   name
     .replace(".", "")
@@ -197,30 +161,9 @@ async function shrinkPhoto(file) {
   return canvas.toDataURL("image/jpeg", 0.8);
 }
 
-// ----- Hiding golfers from each other -----
-
-// A short fingerprint for a pair of golfers. The shared hide list holds only these, never names or ids.
-const fnv = (s, seed) => {
-  let h = seed >>> 0;
-  for (let i = 0; i < s.length; i++) {
-    h ^= s.charCodeAt(i);
-    h = Math.imul(h, 16777619) >>> 0;
-  }
-  return h.toString(16).padStart(8, "0");
-};
-const pairKey = (a, b) => {
-  const s = [a, b].sort().join("|");
-  return fnv(s, 0x811c9dc5) + fnv(s, 0x01000193);
-};
-const hiddenFromMe = (game, meId, hides) => game.players.some((p) => p.id !== meId && hides.has(pairKey(meId, p.id)));
-// Ask how a game went once the tee time is well past
-const gameOver = (g) => Date.now() > gameStart(g).getTime() + 90 * 60 * 1000;
-const PLAYED_KEEP_DAYS = 14;
-
 function validateDetails(v) {
   const e = {};
   if (!v.name.trim()) e.name = "Enter the name you'd like other golfers to see.";
-  if (!validEmail(v.email)) e.email = "Enter an email address like name@example.com.";
   if (!v.area) e.area = "Choose the area where you usually golf.";
   return e;
 }
@@ -514,9 +457,6 @@ function DetailsFields({ v, set, errors, withPicture }) {
         <input id="name" type="text" maxLength={40} autoComplete="nickname" value={v.name} onChange={up("name")} aria-invalid={!!errors.name} />
       </Field>
       {withPicture && <AvatarPicker name={v.name} value={v.avatar} onChange={(avatar) => set({ ...v, avatar })} />}
-      <Field id="email" label="Email address" hint="Kept private. Other golfers never see it." error={errors.email}>
-        <input id="email" type="email" inputMode="email" autoComplete="email" value={v.email} onChange={up("email")} aria-invalid={!!errors.email} />
-      </Field>
       <Field id="area" label="Where do you usually golf?" error={errors.area}>
         <select id="area" value={v.area} onChange={up("area")} aria-invalid={!!errors.area}>
           <option value="">Choose an area</option>
@@ -708,9 +648,151 @@ function GameCard({ game, me, onJoin, onLeave, onCancel, onPostMessage }) {
 
 // ---------- Screens ----------
 
-function Onboarding({ onDone }) {
-  const [v, setV] = useState({ name: "", email: "", area: "" });
-  const [newsletter, setNewsletter] = useState(false);
+function Intro() {
+  return (
+    <section>
+      <h1>Find people to golf with in BC.</h1>
+      <p className="lede">
+        Join a group heading to a pitch & putt or a full course, or post your own tee time and let others fill the spots. It's free.
+      </p>
+      <ol className="steps">
+        <li>
+          <span>
+            <strong>Tell us your area.</strong> We'll show games near you first.
+          </span>
+        </li>
+        <li>
+          <span>
+            <strong>Pick a game with an open spot</strong>, or host your own.
+          </span>
+        </li>
+        <li>
+          <span>
+            <strong>Meet at the course</strong> and play a round with new people.
+          </span>
+        </li>
+      </ol>
+    </section>
+  );
+}
+
+// Sign in with an email link or the 6-digit code from the same email. No passwords.
+function SignIn({ onSignedIn, legacy, startNotice }) {
+  const [email, setEmail] = useState(() => localStore.get(EMAIL_KEY) || legacy?.email || "");
+  const [step, setStep] = useState("email"); // "email" -> "code"
+  const [code, setCode] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [note, setNote] = useState(startNotice || "");
+  const codeRef = useRef(null);
+
+  const sendLink = async () => {
+    const e = email.trim();
+    if (!validEmail(e)) {
+      setError("Enter an email address like name@example.com.");
+      return;
+    }
+    setBusy(true);
+    setError("");
+    setNote("");
+    const res = await api.requestLink(e, legacy || undefined);
+    setBusy(false);
+    if (res.error) {
+      setError(res.error);
+      return;
+    }
+    localStore.set(EMAIL_KEY, e);
+    setStep("code");
+    setTimeout(() => codeRef.current?.focus(), 50);
+  };
+
+  const useCode = async () => {
+    const c = code.replace(/\D/g, "");
+    if (c.length !== 6) {
+      setError("Type the 6-digit code from the email.");
+      return;
+    }
+    setBusy(true);
+    setError("");
+    const res = await api.signInWithCode(email.trim(), c);
+    setBusy(false);
+    if (res.error) {
+      setError(res.error);
+      return;
+    }
+    onSignedIn(res.member);
+  };
+
+  return (
+    <main className="wrap">
+      {step === "email" && <Intro />}
+
+      {step === "email" ? (
+        <section className="panel" aria-labelledby="signin-h">
+          <h2 id="signin-h">Sign in or join</h2>
+          {note && <p className="status">{note}</p>}
+          <Field id="email" label="Your email address" hint="No password needed. We'll email you a link to tap." error={error}>
+            <input
+              id="email"
+              type="email"
+              inputMode="email"
+              autoComplete="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && sendLink()}
+              aria-invalid={!!error}
+            />
+          </Field>
+          <button className="btn" onClick={sendLink} disabled={busy}>
+            {busy ? "Sending…" : "Email me a sign-in link"}
+          </button>
+          <p className="hint">New here? Same button. We'll ask for your name and area next.</p>
+        </section>
+      ) : (
+        <section className="panel" aria-labelledby="code-h">
+          <h2 id="code-h">Check your email</h2>
+          <p>
+            We sent a sign-in link to <strong>{email.trim()}</strong>. Tap the link in that email, or type the 6-digit code from it here.
+          </p>
+          <Field id="code" label="6-digit code" error={error}>
+            <input
+              ref={codeRef}
+              id="code"
+              type="text"
+              inputMode="numeric"
+              autoComplete="one-time-code"
+              maxLength={7}
+              value={code}
+              onChange={(e) => setCode(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && useCode()}
+              aria-invalid={!!error}
+              style={{ maxWidth: "9em", letterSpacing: ".15em", fontSize: "1.2em" }}
+            />
+          </Field>
+          <button className="btn" onClick={useCode} disabled={busy}>
+            {busy ? "Signing in…" : "Sign in"}
+          </button>
+          <p className="hint">Can't find it? Check your junk folder. The link and code work for 15 minutes.</p>
+          <button
+            className="linkbtn"
+            onClick={() => {
+              setStep("email");
+              setCode("");
+              setError("");
+            }}
+          >
+            Send another email, or use a different address
+          </button>
+        </section>
+      )}
+    </main>
+  );
+}
+
+// First sign-in: the details other golfers see
+function Welcome({ me, legacy, onDone }) {
+  const [v, setV] = useState({ name: me.name || legacy?.name || "", area: me.area || legacy?.area || "" });
+  const [newsletter, setNewsletter] = useState(!!(me.newsletter || legacy?.newsletter));
   const [errors, setErrors] = useState({});
   const [saving, setSaving] = useState(false);
 
@@ -725,32 +807,10 @@ function Onboarding({ onDone }) {
 
   return (
     <main className="wrap">
-      <section>
-        <h1>Find people to golf with in BC.</h1>
-        <p className="lede">
-          Join a group heading to a pitch & putt or a full course, or post your own tee time and let others fill the spots. It's free.
-        </p>
-        <ol className="steps">
-          <li>
-            <span>
-              <strong>Tell us your area.</strong> We'll show games near you first.
-            </span>
-          </li>
-          <li>
-            <span>
-              <strong>Pick a game with an open spot</strong>, or host your own.
-            </span>
-          </li>
-          <li>
-            <span>
-              <strong>Meet at the course</strong> and play a round with new people.
-            </span>
-          </li>
-        </ol>
-      </section>
-
-      <section className="panel" aria-labelledby="start-h">
-        <h2 id="start-h">Get started</h2>
+      <Intro />
+      <section className="panel" aria-labelledby="welcome-h">
+        <h2 id="welcome-h">Welcome. A couple of details</h2>
+        <p className="hint">You're signed in as {me.email}.</p>
         <DetailsFields v={v} set={setV} errors={errors} />
         <label className="check">
           <input type="checkbox" checked={newsletter} onChange={(e) => setNewsletter(e.target.checked)} />
@@ -760,9 +820,9 @@ function Onboarding({ onDone }) {
           </span>
         </label>
         <button className="btn" onClick={submit} disabled={saving}>
-          {saving ? "Setting up…" : "Start finding games"}
+          {saving ? "Saving…" : "Start finding games"}
         </button>
-        <p className="hint">Other golfers see your name and area. Nothing else.</p>
+        <p className="hint">Other golfers see your name and area. Your email stays private.</p>
       </section>
     </main>
   );
@@ -1224,13 +1284,13 @@ function NewsletterPanel({ me, onSubscribe }) {
   );
 }
 
-function MyGames({ games, me, goFind, goHost, cardProps, onSaveDetails, onSubscribe, onStartOver, onUnhide }) {
+function MyGames({ games, me, goFind, goHost, cardProps, onSaveDetails, onSubscribe, onSignOut, onUnhide }) {
   const hosting = games.filter((g) => g.hostId === me.id && !g.cancelled).sort((a, b) => gameStart(a) - gameStart(b));
   const joined = games
     .filter((g) => g.hostId !== me.id && g.players.some((p) => p.id === me.id))
     .sort((a, b) => gameStart(a) - gameStart(b));
   const [editing, setEditing] = useState(false);
-  const [v, setV] = useState({ name: me.name, email: me.email, area: me.area, avatar: me.avatar });
+  const [v, setV] = useState({ name: me.name, area: me.area, avatar: me.avatar });
   const [errors, setErrors] = useState({});
   const hidden = me.hidden || [];
 
@@ -1325,9 +1385,15 @@ function MyGames({ games, me, goFind, goHost, cardProps, onSaveDetails, onSubscr
 
       <NewsletterPanel me={me} onSubscribe={onSubscribe} />
 
-      <button className="linkbtn" onClick={onStartOver}>
-        Remove my details from this device
-      </button>
+      <section className="panel">
+        <h2>Signed in</h2>
+        <p>
+          You're signed in as <strong style={{ overflowWrap: "anywhere" }}>{me.email}</strong> on this device. Signing out doesn't change your games.
+        </p>
+        <button className="btn secondary" onClick={onSignOut}>
+          Sign out
+        </button>
+      </section>
     </main>
   );
 }
@@ -1336,8 +1402,9 @@ function MyGames({ games, me, goFind, goHost, cardProps, onSaveDetails, onSubscr
 
 export default function App() {
   const [loading, setLoading] = useState(true);
-  const [me, setMe] = useState(null);
-  const [games, setGames] = useState([]);
+  const [me, setMe] = useState(null); // the signed-in member, from the server
+  const [games, setGames] = useState([]); // upcoming games this member can see
+  const [toAskList, setToAskList] = useState([]); // past games to ask about
   const [tab, setTab] = useState("find");
   const [large, setLarge] = useState(false);
   const [notice, setNotice] = useState(null);
@@ -1346,124 +1413,100 @@ export default function App() {
   const [refreshing, setRefreshing] = useState(false);
   const [filters, setFilters] = useState({ area: "all", type: "any" });
   const [hostPrefill, setHostPrefill] = useState(null); // { course, n } when hosting from the Courses page
-  const [hides, setHides] = useState(() => new Set()); // shared fingerprints of pairs who don't see each other's games
-  const [played, setPlayed] = useState([]); // games you were in, kept on this device so we can ask how they went
+  const [startNotice, setStartNotice] = useState("");
+  const legacy = useMemo(legacyProfile, []);
+
+  // Anything the server sends back about games or the member lands here
+  const absorb = useCallback((res) => {
+    if (!res || res.error) return res;
+    if (Array.isArray(res.games)) setGames(res.games);
+    if (Array.isArray(res.toAsk)) setToAskList(res.toAsk);
+    if (res.member) setMe(res.member);
+    return res;
+  }, []);
+
+  // A server error: show it, and if we've been signed out, go back to the sign-in screen
+  const fail = useCallback((res) => {
+    if (res.status === 401) {
+      setMe(null);
+      setNotice({ kind: "error", text: "You've been signed out. Sign in again to carry on." });
+    } else {
+      setNotice({ kind: "error", text: res.error || "Something went wrong. Try again." });
+    }
+    return false;
+  }, []);
 
   const loadGames = useCallback(async () => {
-    const [g, h] = await Promise.all([store.get(GAMES_KEY, true), store.get(HIDES_KEY, true)]);
-    setGames((g || []).filter(isUpcoming));
-    setHides(new Set(Array.isArray(h) ? h : []));
-  }, []);
-
-  const saveMe = useCallback(async (p) => {
-    setMe(p);
-    await store.set(PROFILE_KEY, p, false);
-  }, []);
+    const res = absorb(await api.games());
+    if (res.error && res.status === 401) fail(res);
+  }, [absorb, fail]);
 
   useEffect(() => {
     (async () => {
-      const [saved, t, pl] = await Promise.all([store.get(PROFILE_KEY, false), store.get(TEXT_KEY, false), store.get(PLAYED_KEY, false)]);
-      if (t === "large") setLarge(true);
-      if (Array.isArray(pl)) setPlayed(pl);
-      const p = withName(saved);
-      if (p) {
-        if (p !== saved) await saveMe(p);
-        else setMe(p);
-        setFilters((f) => ({ ...f, area: p.area }));
-        // Retry a newsletter sign-up that couldn't be sent earlier
-        if (p.newsletter && !p.newsletterSynced && NEWSLETTER_ENDPOINT) {
-          const ok = await subscribeToNewsletter({ email: p.email, firstName: p.name, area: p.area });
-          if (ok) saveMe({ ...p, newsletterSynced: true });
-        }
+      if (localStore.get(TEXT_KEY) === "large") setLarge(true);
+      const q = new URLSearchParams(window.location.search);
+      if (q.has("signin")) {
+        if (q.get("signin") === "expired") setStartNotice("That sign-in link has expired. Ask for a new one below.");
+        window.history.replaceState(null, "", window.location.pathname);
       }
-      await loadGames();
+      const res = await api.me();
+      if (res.member) {
+        setMe(res.member);
+        if (res.member.area) setFilters((f) => ({ ...f, area: res.member.area }));
+        if (res.member.complete) await loadGames();
+      }
       setLoading(false);
     })();
-  }, [loadGames, saveMe]);
+  }, [loadGames]);
 
   useEffect(() => {
-    if (me && tab !== "host") loadGames();
+    if (me?.complete && tab !== "host") loadGames();
     window.scrollTo({ top: 0 });
   }, [tab]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Remember the games you're in (and who else is in them) on this device.
-  // Past games drop off the shared list, so this is how we can still ask how they went.
-  useEffect(() => {
-    if (!me) return;
-    const byId = new Map(played.map((g) => [g.id, g]));
-    let changed = false;
-    for (const g of games) {
-      const old = byId.get(g.id);
-      const inIt = !g.cancelled && g.players.some((p) => p.id === me.id) && g.players.length > 1;
-      if (inIt) {
-        const players = g.players.filter((p) => p.id !== me.id).map(({ id, name, avatar }) => ({ id, name, avatar }));
-        const next = { ...(old || {}), id: g.id, course: g.course, date: g.date, time: g.time, players };
-        if (JSON.stringify(next) !== JSON.stringify(old)) {
-          byId.set(g.id, next);
-          changed = true;
-        }
-      } else if (old) {
-        byId.delete(g.id);
-        changed = true;
-      }
-    }
-    const cutoff = Date.now() - PLAYED_KEEP_DAYS * 86400000;
-    for (const [id, g] of byId) {
-      if (gameStart(g).getTime() < cutoff) {
-        byId.delete(id);
-        changed = true;
-      }
-    }
-    if (!changed) return;
-    const list = [...byId.values()];
-    setPlayed(list);
-    store.set(PLAYED_KEY, list, false);
-  }, [games, me, played]);
+  // ----- Signing in and out -----
 
-  // Always re-read the latest list before changing it, so two people joining
-  // at once don't overwrite each other.
-  const mutateShared = async (key, fn, setter, clean = (x) => x) => {
-    // If someone else changed the list at the same moment, the save is
-    // refused, so we re-read and try again (up to 3 times).
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const latest = clean((await store.get(key, true)) || []);
-      const result = fn(latest);
-      if (result.error) {
-        setter(latest);
-        return { error: result.error };
-      }
-      const ok = await store.set(key, result.next, true);
-      if (ok) {
-        setter(result.next);
-        return { ok: true };
-      }
+  const handleSignedIn = async (member) => {
+    setMe(member);
+    if (member.area) setFilters((f) => ({ ...f, area: member.area }));
+    if (member.complete) {
+      await loadGames();
+      setTab("find");
+      setNotice({ text: `Welcome back, ${member.name}.` });
     }
-    return { error: "That didn't save. Check your internet connection and try again." };
   };
-  const mutateGames = (fn) => mutateShared(GAMES_KEY, fn, setGames, (list) => list.filter(isUpcoming));
-  const mutateHides = (fn) => mutateShared(HIDES_KEY, fn, (list) => setHides(new Set(list)));
 
-  // ----- Actions -----
-
-  // Your name and picture as they appear in posted games
-  const asPlayer = (p) => ({ id: p.id, name: displayName(p), avatar: publicAvatar(p) });
-
-  const handleOnboard = async (v, newsletter) => {
-    const p = {
-      id: uid(),
-      name: v.name.trim(),
-      email: v.email.trim(),
-      area: v.area,
-      newsletter,
-      newsletterSynced: false,
-      joinedAt: Date.now(),
-    };
-    if (newsletter) p.newsletterSynced = await subscribeToNewsletter({ email: p.email, firstName: p.name, area: p.area });
-    await saveMe(p);
-    setFilters({ area: p.area, type: "any" });
+  const finishWelcome = async (v, newsletter) => {
+    let fields = { name: v.name.trim(), area: v.area, newsletter };
+    if (newsletter && !me.newsletter) {
+      fields.newsletterSynced = await subscribeToNewsletter({ email: me.email, firstName: fields.name, area: fields.area });
+    }
+    const res = await api.updateMe(fields);
+    if (res.error) return fail(res);
+    setMe(res.member);
+    setFilters({ area: res.member.area, type: "any" });
+    await loadGames();
     setTab("find");
-    setNotice({ text: `Welcome, ${p.name}. Here are the games in ${p.area}.` });
+    setNotice({ text: `Welcome, ${res.member.name}. Here are the games in ${res.member.area}.` });
+    return true;
   };
+
+  const signOut = () =>
+    setDialog({
+      title: "Sign out on this device?",
+      body: <p>Your games and details stay as they are. Sign back in any time with your email.</p>,
+      confirmLabel: "Yes, sign out",
+      onConfirm: async () => {
+        await api.signOut();
+        setMe(null);
+        setGames([]);
+        setToAskList([]);
+        setTab("find");
+        return { text: "You're signed out." };
+      },
+    });
+
+  // ----- Games -----
 
   const summary = (g) => (
     <dl className="facts">
@@ -1489,13 +1532,7 @@ export default function App() {
       ),
       confirmLabel: "Yes, join this game",
       onConfirm: async () => {
-        const res = await mutateGames((list) => {
-          const g = list.find((x) => x.id === game.id);
-          if (!g || g.cancelled) return { error: "The host cancelled this game." };
-          if (g.players.some((p) => p.id === me.id)) return { next: list };
-          if (g.players.length >= g.totalSpots) return { error: "Someone just took the last spot. This game is now full." };
-          return { next: list.map((x) => (x.id === g.id ? { ...x, players: [...x.players, asPlayer(me)] } : x)) };
-        });
+        const res = absorb(await api.gameAction(game.id, "join"));
         return res.error
           ? { kind: "error", text: res.error }
           : { text: `You're in. See you at ${game.course} on ${fmtLongDate(game.date)} at ${fmtTime(game.time)}.` };
@@ -1514,9 +1551,7 @@ export default function App() {
       confirmLabel: "Yes, leave this game",
       danger: true,
       onConfirm: async () => {
-        const res = await mutateGames((list) => ({
-          next: list.map((x) => (x.id === game.id ? { ...x, players: x.players.filter((p) => p.id !== me.id) } : x)),
-        }));
+        const res = absorb(await api.gameAction(game.id, "leave"));
         return res.error ? { kind: "error", text: res.error } : { text: `You've left the game at ${game.course}.` };
       },
     });
@@ -1537,86 +1572,68 @@ export default function App() {
       confirmLabel: "Yes, cancel this game",
       danger: true,
       onConfirm: async () => {
-        const res = await mutateGames((list) => ({ next: list.map((x) => (x.id === game.id ? { ...x, cancelled: true } : x)) }));
+        const res = absorb(await api.gameAction(game.id, "cancel"));
         return res.error ? { kind: "error", text: res.error } : { text: "Your game is cancelled." };
       },
     });
 
   const postMessage = async (game, text) => {
-    const res = await mutateGames((list) => ({
-      next: list.map((x) =>
-        x.id === game.id
-          ? { ...x, messages: [...(x.messages || []), { id: uid(), name: displayName(me), text, at: Date.now() }].slice(-30) }
-          : x
-      ),
-    }));
-    if (res.error) setNotice({ kind: "error", text: res.error });
+    const res = absorb(await api.gameAction(game.id, "message", { text }));
+    if (res.error) fail(res);
     return !res.error;
   };
 
   const postGame = async (f) => {
-    const game = {
-      ...f,
-      id: uid(),
-      hostId: me.id,
-      players: [asPlayer(me)],
-      messages: [],
-      createdAt: Date.now(),
-    };
-    const res = await mutateGames((list) => ({ next: [...list, game] }));
+    const res = absorb(await api.postGame(f));
     if (res.error) {
-      setNotice({ kind: "error", text: res.error });
+      fail(res);
       return false;
     }
-    setFilters({ area: game.area, type: "any" });
+    setFilters({ area: res.game.area, type: "any" });
     setTab("find");
-    setNotice({ text: `Your game is posted. Golfers in ${game.area} can see it and join now.` });
+    setNotice({ text: `Your game is posted. Golfers in ${res.game.area} can see it and join now.` });
     return true;
   };
 
-  // Update your name and picture in every game you're in
-  const updateMyEntries = (next) =>
-    mutateGames((list) => ({
-      next: list.map((g) => ({ ...g, players: g.players.map((p) => (p.id === me.id ? asPlayer(next) : p)) })),
-    }));
+  // ----- Your details -----
 
   const saveDetails = async (v) => {
-    const next = { ...me, name: v.name.trim(), email: v.email.trim(), area: v.area, avatar: avatarOf({ avatar: v.avatar }) };
-    await saveMe(next);
-    if (displayName(next) !== displayName(me) || JSON.stringify(publicAvatar(next)) !== JSON.stringify(publicAvatar(me))) {
-      await updateMyEntries(next);
-    }
+    const res = await api.updateMe({ name: v.name.trim(), area: v.area, avatar: avatarOf({ avatar: v.avatar }) });
+    if (res.error) return fail(res);
+    setMe(res.member);
     setNotice({ text: "Your details are saved." });
+    return true;
   };
 
   const savePicture = async (avatar) => {
-    const next = { ...me, avatar };
-    await saveMe(next);
-    if (JSON.stringify(publicAvatar(next)) !== JSON.stringify(publicAvatar(me))) await updateMyEntries(next);
+    const res = await api.updateMe({ avatar });
+    if (res.error) return fail(res);
+    setMe(res.member);
     setNotice({ text: avatar.kind === "letter" ? "Your initial it is." : "Your picture is saved." });
+    return true;
   };
 
-  // ----- Hiding golfers from each other -----
-
-  const markAnswered = (game, p, answer) =>
-    setPlayed((prev) => {
-      const list = prev.map((g) => (g.id === game.id ? { ...g, answered: { ...(g.answered || {}), [p.id]: answer } } : g));
-      store.set(PLAYED_KEY, list, false);
-      return list;
-    });
-
-  const hideGolfer = async (p) => {
-    const k = pairKey(me.id, p.id);
-    const res = await mutateHides((list) => ({ next: list.includes(k) ? list : [...list, k] }));
-    if (res.error) return res;
-    const hidden = [...(me.hidden || []).filter((x) => x.id !== p.id), { id: p.id, name: p.name, at: Date.now() }];
-    await saveMe({ ...me, hidden });
-    return { ok: true };
+  const skipPicture = async () => {
+    const res = await api.updateMe({ pictureAsked: true });
+    if (res.error) fail(res);
+    else setMe(res.member);
   };
+
+  const subscribe = async () => {
+    const synced = await subscribeToNewsletter({ email: me.email, firstName: me.name, area: me.area });
+    const res = await api.updateMe({ newsletter: true, newsletterSynced: synced });
+    if (res.error) return fail(res);
+    setMe(res.member);
+    setNotice({ text: "You're signed up for the newsletter." });
+  };
+
+  // ----- After a game: "Would you play with them again?" -----
 
   const answerGame = (game, p, answer) => {
     if (answer === "yes") {
-      markAnswered(game, p, "yes");
+      api.answer(game.id, p.id, "yes").then((res) => (res.error ? fail(res) : absorb(res)));
+      // Take the person off the question straight away
+      setToAskList((list) => list.map((g) => (g.id === game.id ? { ...g, players: g.players.filter((x) => x.id !== p.id) } : g)).filter((g) => g.players.length));
       return;
     }
     setDialog({
@@ -1629,51 +1646,25 @@ export default function App() {
       confirmLabel: "Yes, I'd rather not",
       danger: true,
       onConfirm: async () => {
-        const res = await hideGolfer(p);
+        const res = absorb(await api.answer(game.id, p.id, "no"));
         if (res.error) return { kind: "error", text: res.error };
-        markAnswered(game, p, "no");
         return { text: `Done. You and ${p.name} won't see each other's games.` };
       },
     });
   };
 
-  const skipGame = (game) =>
-    setPlayed((prev) => {
-      const list = prev.map((g) => (g.id === game.id ? { ...g, skipped: true } : g));
-      store.set(PLAYED_KEY, list, false);
-      return list;
-    });
+  const skipGame = async (game) => {
+    setToAskList((list) => list.filter((g) => g.id !== game.id));
+    const res = await api.skip(game.id);
+    if (res.error) fail(res);
+    else absorb(res);
+  };
 
   const unhideGolfer = async (p) => {
-    const k = pairKey(me.id, p.id);
-    const res = await mutateHides((list) => ({ next: list.filter((x) => x !== k) }));
-    if (res.error) {
-      setNotice({ kind: "error", text: res.error });
-      return;
-    }
-    await saveMe({ ...me, hidden: (me.hidden || []).filter((x) => x.id !== p.id) });
+    const res = absorb(await api.unhide(p.id));
+    if (res.error) return fail(res);
     setNotice({ text: `${p.name} can see your games again, and you theirs.` });
   };
-
-  const subscribe = async () => {
-    const synced = await subscribeToNewsletter({ email: me.email, firstName: me.name, area: me.area });
-    await saveMe({ ...me, newsletter: true, newsletterSynced: synced });
-    setNotice({ text: "You're signed up for the newsletter." });
-  };
-
-  const startOver = () =>
-    setDialog({
-      title: "Remove your details from this device?",
-      body: <p>Games you've posted or joined stay listed. You can sign up again any time.</p>,
-      confirmLabel: "Yes, remove my details",
-      danger: true,
-      onConfirm: async () => {
-        await Promise.all([store.del(PROFILE_KEY, false), store.del(PLAYED_KEY, false)]);
-        setPlayed([]);
-        setMe(null);
-        return { text: "Your details were removed from this device." };
-      },
-    });
 
   const runDialog = async () => {
     setBusy(true);
@@ -1686,18 +1677,12 @@ export default function App() {
   const toggleText = () => {
     const next = !large;
     setLarge(next);
-    store.set(TEXT_KEY, next ? "large" : "regular", false);
+    localStore.set(TEXT_KEY, next ? "large" : "regular");
   };
 
   const cardProps = { onJoin: askJoin, onLeave: askLeave, onCancel: askCancel, onPostMessage: postMessage };
-
-  // Games involving someone you've hidden (or who hid you) are left out of Find a game and Courses
-  const visible = useMemo(() => (me ? games.filter((g) => !hiddenFromMe(g, me.id, hides)) : games), [games, hides, me]);
-  // The next past game to ask about, one at a time
-  const toAsk = useMemo(
-    () => played.filter((g) => gameOver(g) && !g.skipped && g.players.some((p) => !g.answered?.[p.id])).sort((a, b) => gameStart(a) - gameStart(b))[0] || null,
-    [played]
-  );
+  const signedIn = !!(me && me.complete);
+  const toAsk = toAskList[0] || null;
 
   return (
     <div className={`pt${large ? " large" : ""}`}>
@@ -1718,7 +1703,7 @@ export default function App() {
         </div>
       </header>
 
-      {me && (
+      {signedIn && (
         <nav className="tabs" aria-label="Main">
           <div className="tabs-inner">
             {[
@@ -1746,13 +1731,15 @@ export default function App() {
 
       {loading ? (
         <main className="wrap">
-          <p className="lede">Loading games…</p>
+          <p className="lede">Loading…</p>
         </main>
       ) : !me ? (
-        <Onboarding onDone={handleOnboard} />
+        <SignIn onSignedIn={handleSignedIn} legacy={legacy} startNotice={startNotice} />
+      ) : !me.complete ? (
+        <Welcome me={me} legacy={legacy} onDone={finishWelcome} />
       ) : tab === "find" ? (
         <FindGames
-          games={visible}
+          games={games}
           me={me}
           filters={filters}
           setFilters={setFilters}
@@ -1767,14 +1754,14 @@ export default function App() {
           toAsk={toAsk}
           askProps={{ onAnswer: answerGame, onSkip: skipGame }}
           showPicture={!me.avatar && !me.pictureAsked}
-          pictureProps={{ onSave: savePicture, onSkip: () => saveMe({ ...me, pictureAsked: true }) }}
+          pictureProps={{ onSave: savePicture, onSkip: skipPicture }}
         />
       ) : tab === "host" ? (
         <HostGame key={hostPrefill?.n || "host"} me={me} onPost={postGame} prefill={hostPrefill?.course} />
       ) : tab === "courses" ? (
         <CourseList
           me={me}
-          games={visible}
+          games={games}
           onHostHere={(c) => {
             setHostPrefill({ course: c.name, n: Date.now() });
             setTab("host");
@@ -1793,7 +1780,7 @@ export default function App() {
           cardProps={cardProps}
           onSaveDetails={saveDetails}
           onSubscribe={subscribe}
-          onStartOver={startOver}
+          onSignOut={signOut}
           onUnhide={unhideGolfer}
         />
       )}
@@ -1802,13 +1789,7 @@ export default function App() {
         <div style={{ maxWidth: "38em", margin: "0 auto", padding: "0 1em 9em" }}>
           <footer className="foot">
             <p>Meet at the course, in public, and let someone know where you're playing.</p>
-            <p>Posted games, your name, and your picture (if you add one) are visible to everyone using Putt Together. Your email stays private.</p>
-            {!NEWSLETTER_ENDPOINT && (
-              <p className="preview">
-                Preview mode: newsletter sign-ups are saved in the app but not sent to Beehiiv yet. Add your sign-up link at the top of the code to
-                connect it.
-              </p>
-            )}
+            <p>Posted games, your name, and your picture (if you add one) are visible to members of Putt Together. Your email stays private.</p>
           </footer>
         </div>
       )}
