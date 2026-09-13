@@ -12,12 +12,14 @@
 //   sessions   signed-in devices (good for a year)
 //   lists      the shared list of games, and the private list of who has hidden whom
 //
-// The sign-in email goes out through Resend (resend.com, free tier is plenty).
-// In Netlify > Project configuration > Environment variables, add:
+// Email (the sign-in link and the Contact us form) goes out through Resend
+// (resend.com, free tier is plenty). In Netlify > Project configuration >
+// Environment variables, add:
 //   RESEND_API_KEY   your Resend API key
-//   MAIL_FROM        the sender, e.g.  Putt Together <hello@mail.merchantsofplay.com>
+//   MAIL_FROM        the sender, e.g.  Putt Together <hello@putttogether.ca>
 //                    (an address on a domain you've verified in Resend)
-// Until both are added, the app says sign-in email isn't set up yet.
+//   CONTACT_TO       optional: where Contact us notes go (default below)
+// Until the first two are added, the app says email isn't set up yet.
 
 import { createHash, randomBytes, randomInt } from "node:crypto";
 import { getStore } from "@netlify/blobs";
@@ -26,7 +28,10 @@ const SESSION_DAYS = 365;
 const LOGIN_MINUTES = 15;
 const LOGINS_PER_HOUR = 5; // sign-in emails per address per hour
 const CODE_ATTEMPTS = 5;
+const CONTACTS_PER_HOUR = 3; // Contact us notes per email address per hour
+const CONTACT_TO = process.env.CONTACT_TO || "savyorish@gmail.com";
 const KEEP_PAST_DAYS = 14; // past games stay this long so we can ask how they went
+const PLAYER_GRACE_HOURS = 3; // people in a game still see it this long after tee time
 const ASK_AFTER_MINUTES = 90; // ask about a game this long after its tee time
 const GAMES_KEY = "putt-games-v1";
 const HIDES_KEY = "putt-hides-v2"; // pairs of member ids, "a|b" sorted. Never sent to browsers.
@@ -77,7 +82,10 @@ const gameStart = (g) => {
   const [h, mi] = g.time.split(":").map(Number);
   return new Date(y, mo - 1, d, h, mi).getTime();
 };
-const isUpcoming = (g) => gameStart(g) > Date.now() - 3 * 3600 * 1000;
+// A game leaves the Find list the moment its tee time passes. People who are in it
+// still see it for a few hours (to find the group, or message that they're late).
+const notStarted = (g) => gameStart(g) > Date.now();
+const recentForPlayers = (g) => gameStart(g) > Date.now() - PLAYER_GRACE_HOURS * 3600 * 1000;
 const isOver = (g) => Date.now() > gameStart(g) + ASK_AFTER_MINUTES * 60 * 1000;
 const keepGame = (g) => gameStart(g) > Date.now() - KEEP_PAST_DAYS * 86400000;
 
@@ -153,41 +161,63 @@ async function completeLogin(rec) {
   return { m, sid };
 }
 
-// ---------- The sign-in email ----------
+// ---------- Email (sign-in links, Contact us) ----------
 
-async function sendLoginEmail({ email, link, code }) {
-  const key = process.env.RESEND_API_KEY;
-  const from = process.env.MAIL_FROM;
-  if (!key || !from) {
-    console.error("Sign-in email isn't set up: add RESEND_API_KEY and MAIL_FROM in Netlify.");
-    return { error: "Sign-in email isn't set up yet. The site owner needs to add the email settings in Netlify." };
+const emailReady = () => !!(process.env.RESEND_API_KEY && process.env.MAIL_FROM);
+
+const escapeHtml = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+
+async function sendEmail({ to, subject, html, text, replyTo, what }) {
+  if (!emailReady()) {
+    console.error("Email isn't set up: add RESEND_API_KEY and MAIL_FROM in Netlify.");
+    return { error: `${what} isn't set up yet. The site owner needs to add the email settings in Netlify.`, notConfigured: true };
   }
-  const pretty = `${code.slice(0, 3)} ${code.slice(3)}`;
-  const text = `Here's your Putt Together sign-in link:\n\n${link}\n\nOr type this code into the app: ${pretty}\n\nThe link and code work for ${LOGIN_MINUTES} minutes. If you didn't ask for this, you can ignore this email.`;
-  const html = `
-<div style="font-family: -apple-system, Segoe UI, Helvetica, Arial, sans-serif; font-size: 19px; line-height: 1.5; color: #17231E; max-width: 34em; margin: 0 auto; padding: 1.5em 1em;">
-  <p style="font-size: 1.4em; font-weight: 700; color: #143426; margin: 0 0 .6em;">Putt Together</p>
-  <p>Tap the button to sign in on this device.</p>
-  <p style="margin: 1.2em 0;"><a href="${link}" style="display: inline-block; background: #1E4A36; color: #fff; text-decoration: none; font-weight: 700; padding: .8em 1.4em; border-radius: 10px;">Sign in to Putt Together</a></p>
-  <p>Or, if you're opening the app somewhere else (your phone, say), type this code into it:</p>
-  <p style="font-size: 2em; font-weight: 700; letter-spacing: .15em; margin: .3em 0 1em;">${pretty}</p>
-  <p style="color: #4A5A53; font-size: .9em;">The link and code work for ${LOGIN_MINUTES} minutes. If you didn't ask for this, you can ignore this email.</p>
-</div>`;
   try {
     const r = await fetch("https://api.resend.com/emails", {
       method: "POST",
-      headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ from, to: [email], subject: "Your Putt Together sign-in link", html, text }),
+      headers: { Authorization: `Bearer ${process.env.RESEND_API_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ from: process.env.MAIL_FROM, to: [to], subject, html, text, ...(replyTo ? { reply_to: replyTo } : {}) }),
     });
     if (!r.ok) {
       console.error("Resend error", r.status, await r.text());
-      return { error: "The sign-in email couldn't be sent. Try again in a minute." };
+      return { error: `${what} couldn't be sent. Try again in a minute.` };
     }
     return { ok: true };
   } catch (err) {
     console.error(err);
-    return { error: "The sign-in email couldn't be sent. Try again in a minute." };
+    return { error: `${what} couldn't be sent. Try again in a minute.` };
   }
+}
+
+const emailShell = (inner) => `
+<div style="background: #0F0F0F; padding: 24px 12px;">
+  <div style="font-family: -apple-system, Segoe UI, Helvetica, Arial, sans-serif; font-size: 18px; line-height: 1.5; color: #F8F8F8; max-width: 34em; margin: 0 auto; background: #202020; border-radius: 22px; padding: 28px 24px;">
+    <p style="font-size: 1.3em; font-weight: 700; color: #5DD62C; margin: 0 0 .8em;">Putt Together</p>
+    ${inner}
+  </div>
+</div>`;
+
+function sendLoginEmail({ email, link, code }) {
+  const pretty = `${code.slice(0, 3)} ${code.slice(3)}`;
+  const text = `Here's your Putt Together sign-in link:\n\n${link}\n\nOr type this code into the app: ${pretty}\n\nThe link and code work for ${LOGIN_MINUTES} minutes. If you didn't ask for this, you can ignore this email.`;
+  const html = emailShell(`
+    <p style="margin: 0 0 1em;">Tap the button to sign in on this device.</p>
+    <p style="margin: 0 0 1.4em;"><a href="${link}" style="display: inline-block; background: #5DD62C; color: #0F0F0F; text-decoration: none; font-weight: 700; padding: .8em 1.4em; border-radius: 12px;">Sign in to Putt Together</a></p>
+    <p style="margin: 0 0 .4em;">Or, if you're opening the app somewhere else (your phone, say), type this code into it:</p>
+    <p style="font-size: 2em; font-weight: 700; letter-spacing: .15em; margin: 0 0 1em; color: #5DD62C;">${pretty}</p>
+    <p style="color: rgba(248,248,248,.6); font-size: .85em; margin: 0;">The link and code work for ${LOGIN_MINUTES} minutes. If you didn't ask for this, you can ignore this email.</p>`);
+  return sendEmail({ to: email, subject: "Your Putt Together sign-in link", html, text, what: "Sign-in email" });
+}
+
+function sendContactEmail({ name, email, message, member }) {
+  const who = member ? `${member.name || "(no name yet)"}, ${member.area || "no area yet"}, signed in as ${member.email}` : "not signed in";
+  const text = `From: ${name || "(no name)"} <${email}>\nMember: ${who}\n\n${message}`;
+  const html = emailShell(`
+    <p style="margin: 0 0 .3em; color: rgba(248,248,248,.6); font-size: .85em;">A note from the Contact us form</p>
+    <p style="margin: 0 0 1em;"><strong>${escapeHtml(name || "(no name)")}</strong> &lt;${escapeHtml(email)}&gt;<br><span style="color: rgba(248,248,248,.6); font-size: .85em;">${escapeHtml(who)}</span></p>
+    <p style="margin: 0; white-space: pre-wrap; padding: 16px; background: #0F0F0F; border-radius: 14px; border-left: 3px solid #5DD62C;">${escapeHtml(message)}</p>
+    <p style="margin: 1.2em 0 0; color: rgba(248,248,248,.6); font-size: .85em;">Reply to this email and it goes straight back to them.</p>`);
+  return sendEmail({ to: CONTACT_TO, subject: `Putt Together: note from ${name || email}`, html, text, replyTo: email, what: "The contact form" });
 }
 
 // ---------- Shared lists (games, hides) with safe concurrent updates ----------
@@ -215,11 +245,16 @@ const mutateGames = (fn) => mutateList(GAMES_KEY, fn, (list) => list.filter(keep
 const readHides = async () => (await readList(HIDES_KEY)).list;
 const mutateHides = (fn) => mutateList(HIDES_KEY, fn);
 
-// What one member sees: upcoming games, minus games with anyone they've hidden or been
-// hidden by. Games they're already in always stay, so a host can still cancel.
+// What one member sees: games that haven't started, minus games with anyone they've
+// hidden or been hidden by. Games they're already in always stay (so a host can still
+// cancel, and the group can still message), for a few hours after tee time.
 function visibleTo(games, m, hides) {
   const set = new Set(hides);
-  return games.filter((g) => isUpcoming(g) && (g.players.some((p) => p.id === m.id) || !g.players.some((p) => set.has(pairOf(m.id, p.id)))));
+  return games.filter((g) => {
+    const mine = g.players.some((p) => p.id === m.id);
+    if (mine) return recentForPlayers(g);
+    return notStarted(g) && !g.players.some((p) => set.has(pairOf(m.id, p.id)));
+  });
 }
 
 // Past games to ask this member about, with the people they haven't answered for yet
@@ -350,6 +385,32 @@ export default async (req) => {
     return reply({ ok: true }, 200, { "Set-Cookie": clearedCookie() });
   }
 
+  // ----- Contact us (anyone, signed in or not) -----
+
+  if (path === "/api/contact" && method === "POST") {
+    const body = await readJson(req);
+    const name = clean(body.name, 60);
+    const email = normEmail(body.email);
+    const message = clean(body.message, 2000);
+    const errors = {};
+    if (!validEmail(email)) errors.email = "Enter an email address like name@example.com, so Syavash can write back.";
+    if (!message) errors.message = "Add a note so he knows what you'd like.";
+    if (Object.keys(errors).length) return reply({ errors }, 400);
+    if (!emailReady()) return reply({ error: "The contact form isn't set up yet.", mailto: CONTACT_TO }, 503);
+
+    const logins = store("logins");
+    const rlKey = "c-" + hash(email);
+    const rl = (await logins.get(rlKey, { type: "json" })) || { n: 0, since: Date.now() };
+    if (Date.now() - rl.since > 3600 * 1000) Object.assign(rl, { n: 0, since: Date.now() });
+    if (rl.n >= CONTACTS_PER_HOUR) return reply({ error: "That's a few notes in a row. Give it an hour and try again." }, 429);
+
+    const member = await currentMember(req);
+    const sent = await sendContactEmail({ name, email, message, member });
+    if (sent.error) return reply({ error: sent.error, ...(sent.notConfigured ? { mailto: CONTACT_TO } : {}) }, 503);
+    await logins.setJSON(rlKey, { n: rl.n + 1, since: rl.since });
+    return reply({ ok: true });
+  }
+
   // ----- Everything below needs a signed-in member -----
 
   const me = await currentMember(req);
@@ -416,6 +477,7 @@ export default async (req) => {
       if (action === "join") {
         if (g.cancelled) return { error: "The host cancelled this game." };
         if (inGame) return { next: list };
+        if (!notStarted(g)) return { error: "That game has already teed off." };
         if (g.players.length >= g.totalSpots) return { error: "Someone just took the last spot. This game is now full." };
         if (g.players.some((p) => hides.has(pairOf(me.id, p.id)))) return { error: "That game isn't available." };
         return { next: list.map((x) => (x.id === id ? { ...x, players: [...x.players, asPlayer(me)] } : x)) };
@@ -482,5 +544,5 @@ export default async (req) => {
 };
 
 export const config = {
-  path: ["/api/login", "/api/login/verify", "/api/login/code", "/api/logout", "/api/me", "/api/games", "/api/games/:id/:action", "/api/answer", "/api/skip", "/api/unhide"],
+  path: ["/api/login", "/api/login/verify", "/api/login/code", "/api/logout", "/api/contact", "/api/me", "/api/games", "/api/games/:id/:action", "/api/answer", "/api/skip", "/api/unhide"],
 };

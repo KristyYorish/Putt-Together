@@ -54,6 +54,7 @@ async function call(path, { method = "GET", body } = {}) {
   if (!res.ok) {
     const firstFieldError = data.errors && typeof data.errors === "object" ? Object.values(data.errors)[0] : null;
     return {
+      ...data,
       error: data.error || firstFieldError || (res.status === 401 ? "Please sign in." : "Something went wrong. Try again."),
       errors: data.errors,
       status: res.status,
@@ -74,4 +75,5 @@ export const api = {
   answer: (gameId, playerId, answer) => call("/api/answer", { method: "POST", body: { gameId, playerId, answer } }),
   skip: (gameId) => call("/api/skip", { method: "POST", body: { gameId } }),
   unhide: (playerId) => call("/api/unhide", { method: "POST", body: { playerId } }),
+  contact: (fields) => call("/api/contact", { method: "POST", body: fields }),
 };
